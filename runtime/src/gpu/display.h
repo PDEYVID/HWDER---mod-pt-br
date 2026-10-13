@@ -16,6 +16,7 @@ struct Device {
     VkQueue queue = VK_NULL_HANDLE;          // renderer queue
     VkQueue present_queue = VK_NULL_HANDLE;  // presentation (same as queue when the family has one queue)
     u32 queue_family = 0;
+    bool demote_to_helper = false;  // shaderDemoteToHelperInvocation enabled
     VkPhysicalDeviceProperties props{};
     VkPhysicalDeviceMemoryProperties mem{};
     std::mutex queue_lock;

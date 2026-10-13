@@ -57,8 +57,23 @@ const AstcRow kAstc[] = {{0x40, 4, 4},  {0x41, 5, 5},  {0x42, 6, 6},   {0x44, 8,
                          {0x46, 12, 12}, {0x50, 5, 4}, {0x51, 6, 5},   {0x52, 8, 6},  {0x53, 10, 8},
                          {0x54, 12, 10}, {0x55, 8, 5}, {0x56, 10, 5},  {0x57, 10, 6}};
 
+// Maxwell's Z24S8 family maps to D24_UNORM_S8_UINT, which AMD does not support as a depth attachment
+// (nor for sampling). Depth contents never travel between guest memory and the host image, so the
+// host format can be swapped for D32_SFLOAT_S8_UINT there; the guest layout (bpb) stays 4 bytes.
+VkFormat host_depth_format(VkFormat f) {
+    if (f != VK_FORMAT_D24_UNORM_S8_UINT) return f;
+    static const VkFormat host = [] {
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        if ((format_features(VK_FORMAT_D24_UNORM_S8_UINT) & need) == need) return VK_FORMAT_D24_UNORM_S8_UINT;
+        hw_log("vk: D24S8 depth is not supported by this GPU - using D32_SFLOAT_S8_UINT");
+        return VK_FORMAT_D32_SFLOAT_S8_UINT;
+    }();
+    return host;
+}
+
 FormatInfo make(VkFormat f, u8 bpb, u8 bw = 1, u8 bh = 1) {
     FormatInfo fi;
+    f = host_depth_format(f);
     fi.vk = f;
     fi.bpb = bpb;
     fi.bw = bw;
@@ -119,7 +134,15 @@ u32 vk_format_bytes(VkFormat f) {
     }
 }
 
+// HWDER_EMULATE_AMD=1 (testing): report the formats AMD lacks - D24S8 depth, 3-component vertex
+// formats - as unsupported, so their fallback paths can be exercised on other GPUs.
+static bool emulate_amd() {
+    static const bool on = getenv("HWDER_EMULATE_AMD") != nullptr;
+    return on;
+}
+
 VkFormatFeatureFlags format_features(VkFormat f) {
+    if (emulate_amd() && f == VK_FORMAT_D24_UNORM_S8_UINT) return 0;
     static std::mutex m;
     static std::unordered_map<u32, VkFormatFeatureFlags> cache;
     std::lock_guard<std::mutex> l(m);
@@ -129,6 +152,18 @@ VkFormatFeatureFlags format_features(VkFormat f) {
     vkGetPhysicalDeviceFormatProperties(display::device().phys, f, &p);
     cache[(u32)f] = p.optimalTilingFeatures;
     return p.optimalTilingFeatures;
+}
+
+VkFormatFeatureFlags buffer_format_features(VkFormat f) {
+    static std::mutex m;
+    static std::unordered_map<u32, VkFormatFeatureFlags> cache;
+    std::lock_guard<std::mutex> l(m);
+    auto it = cache.find((u32)f);
+    if (it != cache.end()) return it->second;
+    VkFormatProperties p{};
+    vkGetPhysicalDeviceFormatProperties(display::device().phys, f, &p);
+    cache[(u32)f] = p.bufferFeatures;
+    return p.bufferFeatures;
 }
 
 FormatInfo tic_format(const u32* tic) {
@@ -320,6 +355,7 @@ VkFormat vertex_format(u32 attrib, u32* size_bytes) {
         static std::unordered_map<u32, bool> ok;
         VkFormatProperties p{};
         vkGetPhysicalDeviceFormatProperties(display::device().phys, f, &p);
+        if (emulate_amd() && (r.size == 0x05 || r.size == 0x13)) p.bufferFeatures = 0;
         if (!(p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
             switch (f) {
             case VK_FORMAT_R8G8B8_UNORM: f = VK_FORMAT_R8G8B8A8_UNORM; break;

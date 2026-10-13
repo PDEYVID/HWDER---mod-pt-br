@@ -273,9 +273,17 @@ void Translator::emit_float(Inst in, Op op) {
     case Op::MUFU: {
         Id a = fabs_neg(F(in.bits(8, 8)), in.bit(46), in.bit(48));
         Id r;
+        // Maxwell's RRO reduces the angle exactly; Vulkan only guarantees sin/cos precision in [-pi, pi]
+        // and AMD's hardware sin/cos degrade quickly beyond it (large time / world-position arguments).
+        auto reduced = [&] {
+            Id t = glsl(t_f32, GLSLstd450Fract, {b.op(spv::OpFMul, t_f32, {a, fc(0.15915494f)})});
+            Id over = b.op(spv::OpFOrdGreaterThan, t_bool, {t, fc(0.5f)});
+            t = select(t_f32, over, b.op(spv::OpFSub, t_f32, {t, fc(1.0f)}), t);
+            return b.op(spv::OpFMul, t_f32, {t, fc(6.28318531f)});
+        };
         switch (in.bits(20, 4)) {
-        case 0: r = glsl(t_f32, GLSLstd450Cos, {a}); break;
-        case 1: r = glsl(t_f32, GLSLstd450Sin, {a}); break;
+        case 0: r = glsl(t_f32, GLSLstd450Cos, {reduced()}); break;
+        case 1: r = glsl(t_f32, GLSLstd450Sin, {reduced()}); break;
         case 2: r = glsl(t_f32, GLSLstd450Exp2, {a}); break;
         case 3: r = glsl(t_f32, GLSLstd450Log2, {a}); break;
         case 4: r = b.op(spv::OpFDiv, t_f32, {fc(1), a}); break;

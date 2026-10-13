@@ -95,6 +95,9 @@ public:
     // returned types are baked into the SPIR-V, so they belong in the pipeline key when non-default.
     virtual AttributeType attribute_type(u32 index) { return AttributeType::Float; }
     virtual AttributeType render_target_type(u32 rt) { return AttributeType::Float; }
+    // A 3-component vertex attribute the host fetches as 4 components (the GPU lacks the RGB format):
+    // its 4th component is the next bytes of the vertex and must read as 1 instead. Baked into the SPIR-V.
+    virtual bool attribute_padded(u32 index) { return false; }
 };
 
 struct Options {
@@ -102,6 +105,10 @@ struct Options {
     // Alternatively leave it false and use a negative-height viewport.
     bool flip_y = false;
     bool convert_depth_mode = false;  // GL [-1,1] -> Vulkan [0,1] in the last pre-raster stage: z = (z + w) / 2
+    // KIL demotes the pixel to a helper invocation (shaderDemoteToHelperInvocation) instead of OpKill:
+    // its quad neighbours' derivatives and quad ops keep valid inputs, as on Maxwell. OpKill terminates
+    // the lane on AMD, leaving 2x2 blocks with garbage derivatives.
+    bool demote_to_helper = false;
 };
 // Push constants: the translator only declares the block when a shader needs it (currently
 // base_instance for InstanceId, which is gl_InstanceIndex - base_instance as on Maxwell).

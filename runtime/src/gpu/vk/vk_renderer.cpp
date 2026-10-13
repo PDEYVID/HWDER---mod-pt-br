@@ -252,7 +252,7 @@ void Recorder::defer(std::function<void()> fn) {
 Slice Recorder::stage(u64 size, u64 align) {
     cmd_in_pass();
     Slice s;
-    if (size > kSegSize / 2) {
+    auto dedicated = [&] {
         g_s.replay_unsafe = true;  // destroyed with the frame: a replay could not reference it
         Buffer* b = new Buffer(create_buffer(size, kRingUsage, true));
         s.buf = b->buf;
@@ -263,7 +263,8 @@ Slice Recorder::stage(u64 size, u64 align) {
             delete b;
         });
         return s;
-    }
+    };
+    if (size > kSegSize / 2) return dedicated();
     u64 head = (g_s.ring_head + align - 1) & ~(align - 1);
     u32 seg = (u32)(g_s.ring_head / kSegSize);
     // A head exactly at the ring end reads as segment 16: that is a wrap to segment 0 too.
@@ -279,9 +280,13 @@ Slice Recorder::stage(u64 size, u64 align) {
         }
         head = (u64)seg * kSegSize;
         u64 last = g_s.seg_serial[seg];
-        if (last >= serial_) {  // ring exhausted by the current command buffer: submit it first
-            flush();
-            cmd_in_pass();
+        if (last >= serial_) {
+            // Ring exhausted by the current command buffer. Submitting it here would split a draw in the
+            // middle of being built (its descriptor sets and staged vertex data belong to the submitted
+            // frame, whose pools get reset while the next command buffer still uses them): use a buffer
+            // that lives as long as this frame instead.
+            VK_LOG_ONCE("vk: staging ring exhausted within one command buffer - using dedicated buffers");
+            return dedicated();
         }
         SlowTimer timer("staging ring wrap wait", 30.0);
         wait_serial(last);
@@ -451,6 +456,21 @@ VkFormat cached_vertex_format(u32 raw, u32* size) {
     return it->second.first;
 }
 
+// The guest attribute has 3 components (R8G8B8 / R16G16B16) but the host fetches it with a 4-component
+// format because the GPU has no vertex support for the 3-component one (AMD).
+bool vertex_format_padded(u32 raw) {
+    u32 size = (raw >> 21) & 0x3F;
+    if (size != 0x05 && size != 0x13) return false;
+    switch (cached_vertex_format(raw, nullptr)) {
+    case VK_FORMAT_R8G8B8_UNORM: case VK_FORMAT_R8G8B8_SNORM: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8_SINT:
+    case VK_FORMAT_R8G8B8_USCALED: case VK_FORMAT_R8G8B8_SSCALED: case VK_FORMAT_R16G16B16_UNORM:
+    case VK_FORMAT_R16G16B16_SNORM: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16_SINT:
+    case VK_FORMAT_R16G16B16_USCALED: case VK_FORMAT_R16G16B16_SSCALED: case VK_FORMAT_R16G16B16_SFLOAT:
+        return false;
+    default: return true;
+    }
+}
+
 VkLogicOp logic_op(u32 v) { return v >= 0x1500 && v <= 0x150F ? (VkLogicOp)(v - 0x1500) : VK_LOGIC_OP_COPY; }
 
 VkImageViewType view_type(shader::TextureType t) {
@@ -490,6 +510,7 @@ public:
     u32 smem = 0;
     u64 attr_types = 0;  // 2 bits per attribute (shader::AttributeType)
     u32 rt_types = 0;    // 2 bits per render target
+    u32 attr_padded = 0;  // attributes fetched with a padded 4-component format (W forced to 1)
 
     u64 read_instruction(u32 address) override {
         u64 off = (graphics ? 0x50 : 0) + (u64)address;
@@ -512,6 +533,7 @@ public:
     shader::AttributeType render_target_type(u32 rt) override {
         return rt < 8 ? (shader::AttributeType)((rt_types >> (rt * 2)) & 3) : shader::AttributeType::Float;
     }
+    bool attribute_padded(u32 index) override { return index < 32 && ((attr_padded >> index) & 1); }
 };
 
 shader::AttributeType format_numeric_type(VkFormat f) {
@@ -808,6 +830,10 @@ private:
     void sync_shadows(const std::vector<OpRec>& ops);
     bool recording_ = false;
     bool draw_samples_rt_ = false;  // the draw being built samples a render target (post-process pass)
+    std::vector<Image*> draw_sampled_rts_;  // ...and which ones
+    // Attachments of the current rendering instance written since it began (bit i: color i, bit 8:
+    // depth/stencil). Sampling one of them in a later draw of the same instance is a feedback loop.
+    u32 pass_written_ = 0;
     std::vector<OpRec> rec_cur_, rec_prev_;
     u64 rec_destroy_count_ = 0, frame_first_serial_ = 0;
     double interp_acc_ = 0;
@@ -842,6 +868,8 @@ private:
     // ---------------------------------------------------------- resources
     void create_dummies();
     VkImageView dummy_view(VkImageViewType t);
+    VkImageView depth_standin(Image* color, VkImageViewType t);
+    std::unordered_map<u64, Image*> depth_standins_;  // depth value bits -> 1x1 (6-layer) D32 image
     Framebuffer resolve_framebuffer(const u32* regs, bool for_clear, u32 clear_rt);
     void begin_rendering(const Framebuffer& fb);
     StageLayout* stage_layout(const shader::Resources& r, VkShaderStageFlags stages);
@@ -973,6 +1001,7 @@ private:
     struct Stats {
         u64 draws, skipped, clears, dispatches, blits, pipelines, shaders, images_created;
         u64 tic_hit, tic_miss, vb_hit, vb_miss, idx_hit, idx_miss;
+        u64 feedback_splits;  // rendering instances restarted for a draw sampling its own attachment
     } st_{};
     bool verbose_ = getenv("HWDER_VK_VERBOSE") != nullptr;
     // HWDER_VK_FRAME_DUMP=<present index>: log every draw/clear/blit of that frame with its targets and sources.
@@ -1013,8 +1042,63 @@ void VkRenderer::create_dummies() {
     o.type = ImageType::e1D;
     dummy1d_ = tc_.get((u64)zeros + 128, o, new Subresource);
     u32 tsc[8] = {2 | (2 << 3) | (2 << 6), 1 | (1 << 4) | (1 << 6), 0, 0, 0, 0, 0, 0};
-    dummy_sampler_ = tc_.sampler(tsc);
+    dummy_sampler_ = tc_.sampler(tsc, false);
     g_rec.flush();
+}
+
+// A depth image whose every texel is the (uniform) red channel of `color`, or null when the color
+// texture is not uniform / not a format handled here.
+VkImageView VkRenderer::depth_standin(Image* color, VkImageViewType t) {
+    if (t == VK_IMAGE_VIEW_TYPE_3D || t == VK_IMAGE_VIEW_TYPE_1D || t == VK_IMAGE_VIEW_TYPE_1D_ARRAY) return VK_NULL_HANDLE;
+    if (color->gpu_modified || color->readable < 4) return VK_NULL_HANDLE;
+    const u8* p = (const u8*)color->addr;
+    u64 n = std::min<u64>(color->readable, 64 << 10);
+    u32 stride = 4, roff = 0;
+    float scale = 1.0f / 255.0f;
+    bool f32 = false;
+    switch (color->info.fmt.vk) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: break;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: roff = 2; break;
+    case VK_FORMAT_R8_UNORM: stride = 1; break;
+    case VK_FORMAT_R32_SFLOAT: f32 = true; break;
+    default: VK_LOG_ONCE("vk: depth-compare sample of color format %d not emulated", (int)color->info.fmt.vk); return VK_NULL_HANDLE;
+    }
+    float d;
+    if (f32) {
+        memcpy(&d, p, 4);
+        for (u64 i = 4; i + 4 <= n; i += 4)
+            if (memcmp(p + i, p, 4) != 0) return VK_NULL_HANDLE;
+    } else {
+        for (u64 i = stride + roff; i < n; i += stride)
+            if (p[i] != p[roff]) {
+                VK_LOG_ONCE("vk: depth-compare sample of a non-uniform color texture not emulated");
+                return VK_NULL_HANDLE;
+            }
+        d = p[roff] * scale;
+    }
+    u32 bits;
+    memcpy(&bits, &d, 4);
+    auto it = depth_standins_.find(bits);
+    Image* img = it != depth_standins_.end() ? it->second : nullptr;
+    if (!img) {
+        if (depth_standins_.size() >= 64) return VK_NULL_HANDLE;
+        static u8 fake[64 * 64];  // distinct fake guest addresses, never touched by the guest
+        ImageInfo i;
+        i.fmt = zeta_format(0x0A);  // D32_SFLOAT
+        i.width = i.height = 1;
+        i.layers = 6;
+        i.block_linear = false;
+        i.pitch = 4;
+        img = tc_.get((u64)(fake + depth_standins_.size() * 64), i, new Subresource);
+        VkClearDepthStencilValue v{d, 0};
+        VkImageSubresourceRange rr{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 6};
+        g_rec.barrier();
+        vkCmdClearDepthStencilImage(g_rec.cmd(), img->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &rr);
+        g_rec.barrier();
+        depth_standins_[bits] = img;
+        hw_log("vk: depth-compare of a color texture: using a depth stand-in (%.3f)", d);
+    }
+    return tc_.view(img, VK_FORMAT_UNDEFINED, t, 0, 1, 0, 6);
 }
 
 VkImageView VkRenderer::dummy_view(VkImageViewType t) {
@@ -1146,6 +1230,7 @@ void VkRenderer::begin_rendering(const Framebuffer& fb) {
     vkCmdBeginRendering(cb, &ri);
     g_rec.rendering = true;
     cur_fb_ = fb;
+    pass_written_ = 0;
 }
 
 StageLayout* VkRenderer::stage_layout(const shader::Resources& r, VkShaderStageFlags stages) {
@@ -1184,7 +1269,10 @@ ShaderEntry* VkRenderer::get_shader(GuestEnv& env, shader::Stage stage, const sh
     u64 h = shader::hash_program(env, stage);
     if (va) h = h * 31 + shader::hash_program(*va, shader::Stage::VertexA);
     u64 key = h ^ ((u64)stage << 56) ^ ((u64)opt.convert_depth_mode << 60) ^ ((u64)opt.flip_y << 61);
-    if (stage == shader::Stage::VertexB) key = hash_bytes(&env.attr_types, 8, key);
+    if (stage == shader::Stage::VertexB) {
+        key = hash_bytes(&env.attr_types, 8, key);
+        if (env.attr_padded) key = hash_bytes(&env.attr_padded, 4, key);
+    }
     if (stage == shader::Stage::Fragment) key = hash_bytes(&env.rt_types, 4, key);
     auto it = shaders_.find(key);
     if (it != shaders_.end()) return it->second;
@@ -1253,6 +1341,7 @@ GfxProgram* VkRenderer::get_program_slow(const u32* regs, u64* key_out) {
     u64 vas[6] = {};
     shader::Options opt;
     opt.convert_depth_mode = regs[DepthMode] == 0;
+    opt.demote_to_helper = display::device().demote_to_helper;
     u64 key = 0x12345;
     for (u32 i = 0; i < 6; i++) {
         u32 cfg = regs[Pipelines + i * 16];
@@ -1295,11 +1384,13 @@ GfxProgram* VkRenderer::get_program_slow(const u32* regs, u64* key_out) {
     }
     // numeric types of vertex attributes and render targets (baked into the SPIR-V)
     u64 attr_types = 0;
+    u32 attr_padded = 0;
     for (u32 a = 0; a < 32; a++) {
         u32 raw = regs[VertexAttribFormat + a];
         if ((raw >> 6) & 1) continue;
         VkFormat f = cached_vertex_format(raw, nullptr);
         attr_types |= (u64)format_numeric_type(f) << (a * 2);
+        if (vertex_format_padded(raw)) attr_padded |= 1u << a;
     }
     u32 rt_types = 0;
     {
@@ -1311,6 +1402,7 @@ GfxProgram* VkRenderer::get_program_slow(const u32* regs, u64* key_out) {
         }
     }
     envs[0].attr_types = envs[1].attr_types = attr_types;
+    envs[0].attr_padded = envs[1].attr_padded = attr_padded;
     envs[5].rt_types = rt_types;
     // stage hashes
     // Hashing a whole program per draw is too slow: memoize by code address, validated with a hash
@@ -1330,6 +1422,7 @@ GfxProgram* VkRenderer::get_program_slow(const u32* regs, u64* key_out) {
     }
     key = hash_bytes(hashes, sizeof(hashes), opt.convert_depth_mode);
     key = hash_bytes(&attr_types, 8, key);
+    if (attr_padded) key = hash_bytes(&attr_padded, 4, key);
     key = hash_bytes(&rt_types, 4, key);
     *key_out = key;
     auto it = programs_.find(key);
@@ -1698,6 +1791,12 @@ bool VkRenderer::bind_resources(const shader::Resources& res, StageLayout* sl, V
                 u32 texels = (((tic[3] & 0xFFFF) << 16) | (tic[4] & 0xFFFF)) + 1;
                 u64 bytes = (u64)texels * fi.bpb;
                 u8* src = va ? host(va) : nullptr;
+                // A texel-buffer view of an unsupported format is not rejected by every driver (AMD returns
+                // garbage); such a buffer reads as zeros instead.
+                if (fi.valid() && !(buffer_format_features(fi.vk) & VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT)) {
+                    VK_LOG_ONCE("vk: texel buffer format %d not supported by the GPU", (int)fi.vk);
+                    src = nullptr;
+                }
                 if (src && fi.valid() && bytes) {
                     bytes = std::min<u64>(bytes, 64ull << 20);
                     if (bytes > (1u << 20)) VK_LOG_ONCE("vk: texel buffer of %llu KiB bound (copied per draw)", (unsigned long long)(bytes >> 10));
@@ -1771,7 +1870,10 @@ bool VkRenderer::bind_resources(const shader::Resources& res, StageLayout* sl, V
                     tc_.validate(te->img);
                     if (te->view) ii.imageView = te->view;
                     iref = {te->img, te->vp};
-                    if (te->img->info.render_target || te->img->gpu_modified) draw_samples_rt_ = true;
+                    if (te->img->info.render_target || te->img->gpu_modified) {
+                        draw_samples_rt_ = true;
+                        draw_sampled_rts_.push_back(te->img);
+                    }
                 } else {
                 ImageInfo info;
                 u64 a;
@@ -1826,7 +1928,10 @@ bool VkRenderer::bind_resources(const shader::Resources& res, StageLayout* sl, V
                                              aspect);
                     if (v) ii.imageView = v;
                     iref = {img, {info.fmt.vk, vt, sub.level + bl, nl, sub.layer + blayer, layers, swz, aspect}};
-                    if (img->info.render_target || img->gpu_modified) draw_samples_rt_ = true;
+                    if (img->info.render_target || img->gpu_modified) {
+                        draw_samples_rt_ = true;
+                        draw_sampled_rts_.push_back(img);
+                    }
                     if (!dumping() && !tc_.has_same_addr_alias(img)) {
                         if (tic_cache_.size() > 65536) tic_cache_.clear();
                         TicEntry e;
@@ -1865,7 +1970,18 @@ bool VkRenderer::bind_resources(const shader::Resources& res, StageLayout* sl, V
             }
             {
                 ProfScope sps(kProfSampler);
-                if (read_tic(((u64)pools[3] << 32) | pools[4], pools[5], tsc_id, tsc)) ii.sampler = tc_.sampler(tsc);
+                if (read_tic(((u64)pools[3] << 32) | pools[4], pools[5], tsc_id, tsc))
+                    ii.sampler = tc_.sampler(tsc, t.is_depth && iref_outer.img && iref_outer.img->info.fmt.depth);
+                if (t.is_depth && iref_outer.img && !iref_outer.img->info.fmt.depth && ii.sampler != dummy_sampler_) {
+                    // Depth-compare sample of a color texture (the game binds an 8x8 RGBA8 placeholder as a
+                    // shadow map): Maxwell compares against its red channel; in Vulkan a Dref sample of a
+                    // color view is undefined (AMD: 0, i.e. fully shadowed). Bind a depth image holding
+                    // that red value instead.
+                    if (VkImageView sv = depth_standin(iref_outer.img, vt)) {
+                        ii.imageView = sv;
+                        ii.sampler = tc_.sampler(tsc, true);
+                    }
+                }
             }
             if (rec_out) rec_out->image_refs.push_back(iref_outer);
             dw.images.push_back(ii);
@@ -2309,6 +2425,7 @@ void VkRenderer::do_draw(const u32* regs, const DrawParams& p, const void* inlin
     VkDescriptorSet sets[5] = {};
     std::vector<std::function<void()>> post;
     draw_samples_rt_ = false;
+    draw_sampled_rts_.clear();
     OpRec* oprec = nullptr;
     if (recording_) {
         rec_cur_.emplace_back();
@@ -2469,6 +2586,21 @@ void VkRenderer::do_draw(const u32* regs, const DrawParams& p, const void* inlin
                (int)fb.color_format[0], (int)fb.depth_format, (unsigned long long)prog_key);
 
     // ---- record
+    if (draw_samples_rt_ && pass_written_ && g_rec.rendering && cur_fb_ == fb) {
+        // The draw samples an attachment that earlier draws of this rendering instance wrote. Maxwell's
+        // texture unit sees those writes; in Vulkan that is an undefined feedback loop, and on AMD
+        // (compressed color/depth) it reads garbage tiles. Restart the instance behind a barrier.
+        bool loop = false;
+        for (Image* img : draw_sampled_rts_) {
+            if (img == fb.depth && (pass_written_ & 0x100)) loop = true;
+            for (u32 i = 0; i < fb.num_colors; i++)
+                if (img == fb.color[i] && (pass_written_ & (1u << i))) loop = true;
+        }
+        if (loop) {
+            st_.feedback_splits++;
+            g_rec.end_rendering();
+        }
+    }
     begin_rendering(fb);
     VkCommandBuffer cb = g_rec.cmd_in_pass();
     if (rs_.serial != g_rec.serial()) {
@@ -2640,8 +2772,14 @@ void VkRenderer::do_draw(const u32* regs, const DrawParams& p, const void* inlin
         vkCmdDraw(cb, count, 1, first_vertex, p.base_instance);
     }
     for (u32 i = 0; i < fb.num_colors; i++)
-        if (fb.color[i] && key.color_mask[i]) tc_.mark_modified(fb.color[i]);
-    if (fb.depth && (key.depth_write || key.stencil_enable)) tc_.mark_modified(fb.depth);
+        if (fb.color[i] && key.color_mask[i]) {
+            tc_.mark_modified(fb.color[i]);
+            pass_written_ |= 1u << i;
+        }
+    if (fb.depth && (key.depth_write || key.stencil_enable)) {
+        tc_.mark_modified(fb.depth);
+        pass_written_ |= 0x100;
+    }
     if (oprec) {
         DrawRec& d = oprec->draw;
         d.fb = fb;
@@ -2750,6 +2888,7 @@ void VkRenderer::do_clear(const u32* regs, u32 v) {
     }
     begin_rendering(fb);
     vkCmdClearAttachments(g_rec.cmd_in_pass(), (u32)att.size(), att.data(), 1, &r);
+    pass_written_ = ~0u;
 }
 
 // ------------------------------------------------------------------ frame interpolation replay
@@ -3500,6 +3639,10 @@ void VkRenderer::present(const FramebufferInfo& fb) {
                    (unsigned long long)st_.tic_miss, (unsigned long long)st_.vb_hit, (unsigned long long)st_.vb_miss,
                    (unsigned long long)st_.idx_hit, (unsigned long long)st_.idx_miss);
             st_.tic_hit = st_.tic_miss = st_.vb_hit = st_.vb_miss = st_.idx_hit = st_.idx_miss = 0;
+            if (st_.feedback_splits) {
+                hw_log("vk: %llu feedback-loop splits since last report", (unsigned long long)st_.feedback_splits);
+                st_.feedback_splits = 0;
+            }
             hw_log("vk: frame %llu: draws %llu (skipped %llu) clears %llu dispatches %llu blits %llu | %zu programs %zu "
                    "pipelines %zu shaders | tex: %u uploads (%llu KiB) %u downloads %u created", (unsigned long long)g_s.present_count,
                    (unsigned long long)st_.draws, (unsigned long long)st_.skipped, (unsigned long long)st_.clears,

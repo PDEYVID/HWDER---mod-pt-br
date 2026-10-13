@@ -21,7 +21,7 @@ of your own `.nsp` with your own `prod.keys` at run time. Nothing is extracted t
    `%USERPROFILE%\.switch\prod.keys` and the yuzu / Ryujinx key folders.
 3. Run `hwder.exe`.
 
-Requirements: Windows 10/11 x64, a Vulkan 1.2 driver (NVIDIA, AMD, Intel), an AVX2 CPU, and
+Requirements: Windows 10/11 x64, a Vulkan 1.3 driver (NVIDIA, AMD, Intel), an AVX2 CPU, and
 Media Foundation (built into Windows; "N" editions need the Media Feature Pack) for the movies.
 
 In game: **F1** opens the options overlay (internal resolution scale, unlocked resolution for
@@ -214,7 +214,10 @@ docs/              design decisions
 
 `HWDER_NSP`, `HWDER_KEYS`, `HWDER_EXEFS`, `HWDER_ROMFS` select the game data; `HWDER_LOG` the
 log file; `HWDER_MUTE=1` silences audio; `HWDER_RES_SCALE` overrides the resolution scale;
-`HWDER_VALIDATION=1` enables Vulkan validation layers; `HWDER_VK_FRAME_DUMP`, `HWDER_GPU_TRACE`,
+`HWDER_VALIDATION=1` enables Vulkan validation layers (messages go to `hwder.log`); `HWDER_GPU=<index or
+part of the name>` picks the GPU on multi-GPU systems (the log lists them); `HWDER_EMULATE_AMD=1` makes the
+renderer treat the formats AMD drivers lack (D24S8 depth, 3-component vertex formats) as unsupported, to
+exercise those fallbacks on other GPUs; `HWDER_VK_FRAME_DUMP`, `HWDER_GPU_TRACE`,
 `HWDER_IPC_TRACE`, `HWDER_FS_TRACE` and the other `HWDER_*_TRACE` switches dump the respective
 subsystem's activity to the log.
 

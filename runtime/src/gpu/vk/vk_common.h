@@ -78,6 +78,7 @@ VkFormat vertex_format(u32 attrib, u32* size_bytes);
 u32 vk_format_bytes(VkFormat f);  // host bytes per texel (uncompressed) or per block
 bool vk_format_compressed(VkFormat f);
 VkFormatFeatureFlags format_features(VkFormat f);  // optimal tiling, cached
+VkFormatFeatureFlags buffer_format_features(VkFormat f);  // buffer features, cached
 void decode_astc(const u8* src, u32 width, u32 height, u32 depth, u32 bw, u32 bh, u8* dst_rgba8);
 
 // ------------------------------------------------------------------ host buffers
@@ -202,6 +203,7 @@ struct Image {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageUsageFlags usage = 0;  // as created
     std::unordered_map<ViewKey, VkImageView, ViewKeyHash> views;
     bool gpu_modified = false;   // GPU data newer than guest memory
     u64 write_seq = 0;           // order of the last GPU write (aliasing images are refreshed from the newest)
@@ -242,7 +244,9 @@ public:
     bool has_same_addr_alias(Image* img);   // another image starts at the same address (padded RT vs sampled)
     VkImageView view(Image* img, VkFormat fmt, VkImageViewType type, u32 base_level, u32 levels, u32 base_layer,
                      u32 layers, VkComponentMapping swz = {}, VkImageAspectFlags aspect = 0);
-    VkSampler sampler(const u32* tsc);
+    // compare: the shader samples with a depth reference (the TSC's compare bit alone must not enable
+    // it: comparison on a non-Dref sample, or on a color view, is undefined - black on AMD).
+    VkSampler sampler(const u32* tsc, bool compare);
     void mark_modified(Image* img, bool clear = false) {
         // Diagnostic: a draw into a buffer that was presented and not cleared since means the present
         // happened before the frame's rendering was complete (fence reached too early).

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <cmath>
 #include <thread>
 #include <vector>
@@ -22,6 +23,9 @@ static VkSurfaceKHR g_surface;
 static VkSwapchainKHR g_swapchain;
 static VkExtent2D g_extent;
 static std::vector<VkImage> g_images;
+// One "rendered" semaphore per swapchain image: a present holds its semaphore until that image is
+// acquired again, so a per-frame-slot semaphore could be re-signaled while still in use.
+static std::vector<VkSemaphore> g_rendered;
 static VkCommandPool g_pool;
 static std::mutex g_status_lock;
 static std::string g_status = "booting";
@@ -183,39 +187,118 @@ static void create_swapchain() {
     vkGetSwapchainImagesKHR(g_dev.dev, sc, &n, nullptr);
     g_images.resize(n);
     vkGetSwapchainImagesKHR(g_dev.dev, sc, &n, g_images.data());
+    while (g_rendered.size() < n) {  // callers recreate the swapchain only after vkDeviceWaitIdle
+        VkSemaphoreCreateInfo sci2{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkSemaphore sem;
+        VKCHECK(vkCreateSemaphore(g_dev.dev, &sci2, nullptr, &sem));
+        g_rendered.push_back(sem);
+    }
     overlay::on_swapchain(g_images, sci.imageFormat);
+}
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                         VkDebugUtilsMessageTypeFlagsEXT,
+                                                         const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    // HWDER_VALIDATION: validation layer output goes to hwder.log (each distinct message id a few times).
+    static std::mutex lock;
+    static std::map<s32, u32> seen;
+    std::lock_guard<std::mutex> g(lock);
+    if (seen[data->messageIdNumber]++ >= 3) return VK_FALSE;
+    hw_log("vk-validation %s: %s", severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning",
+           data->pMessage ? data->pMessage : "");
+    return VK_FALSE;
+}
+
+static void log_loader() {
+    HMODULE lib = GetModuleHandleA("vulkan-1.dll");
+    wchar_t path[MAX_PATH] = L"?";
+    if (lib) GetModuleFileNameW(lib, path, MAX_PATH);
+    u32 ver = VK_API_VERSION_1_0;
+    auto enum_ver = (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion");
+    if (enum_ver) enum_ver(&ver);
+    hw_log("vulkan: loader %ls (instance api %u.%u.%u)", path, VK_API_VERSION_MAJOR(ver), VK_API_VERSION_MINOR(ver),
+           VK_API_VERSION_PATCH(ver));
+    // Implicit layers (overlays, recorders) load into every Vulkan app and are the usual suspects when
+    // instance creation fails or crashes: list what the loader sees.
+    u32 n = 0;
+    vkEnumerateInstanceLayerProperties(&n, nullptr);
+    std::vector<VkLayerProperties> layers(n);
+    vkEnumerateInstanceLayerProperties(&n, layers.data());
+    std::string names;
+    for (auto& l : layers) names += std::string(" ") + l.layerName;
+    hw_log("vulkan: %u layer(s) available:%s", n, names.c_str());
+}
+
+static const char* device_type_name(VkPhysicalDeviceType t) {
+    switch (t) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return "discrete";
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated";
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return "virtual";
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: return "cpu";
+    default: return "other";
+    }
 }
 
 static void init_vulkan() {
     if (!hw_vk_load_global()) hw_fatal("vulkan-1.dll not found - a Vulkan capable GPU driver is required");
+    log_loader();
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "HWDER";
     app.apiVersion = VK_API_VERSION_1_3;
-    const char* inst_ext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    const bool validation = getenv("HWDER_VALIDATION") != nullptr;
+    std::vector<const char*> inst_ext = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    if (validation) inst_ext.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 2;
-    ici.ppEnabledExtensionNames = inst_ext;
+    ici.enabledExtensionCount = (u32)inst_ext.size();
+    ici.ppEnabledExtensionNames = inst_ext.data();
     const char* layer = "VK_LAYER_KHRONOS_validation";
-    if (getenv("HWDER_VALIDATION")) {
+    if (validation) {
         ici.enabledLayerCount = 1;
         ici.ppEnabledLayerNames = &layer;
     }
-    VKCHECK(vkCreateInstance(&ici, nullptr, &g_dev.instance));
+    VkResult ir = vkCreateInstance(&ici, nullptr, &g_dev.instance);
+    if (ir != VK_SUCCESS) {
+        hw_log("vulkan: vkCreateInstance failed (%d)", (int)ir);
+        hw_fatal("Vulkan instance creation failed - update your GPU driver (Vulkan 1.3 is required)");
+    }
     hw_vk_load_instance(g_dev.instance);
+    if (validation && vkCreateDebugUtilsMessengerEXT) {
+        VkDebugUtilsMessengerCreateInfoEXT mci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        mci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
+        mci.pfnUserCallback = validation_message;
+        VkDebugUtilsMessengerEXT messenger;
+        vkCreateDebugUtilsMessengerEXT(g_dev.instance, &mci, nullptr, &messenger);
+    }
     u32 n = 0;
     vkEnumeratePhysicalDevices(g_dev.instance, &n, nullptr);
     std::vector<VkPhysicalDevice> pds(n);
     vkEnumeratePhysicalDevices(g_dev.instance, &n, pds.data());
-    for (auto pd : pds) {
+    pds.resize(n);
+    // HWDER_GPU=<index or part of the name> overrides the choice (laptops with two GPUs).
+    const char* want = getenv("HWDER_GPU");
+    int best_score = -1;
+    for (u32 i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(pd, &p);
-        if (!g_dev.phys || p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-            g_dev.phys = pd;
+        vkGetPhysicalDeviceProperties(pds[i], &p);
+        hw_log("vulkan: device %u: %s (%s, api %u.%u.%u, driver 0x%x, vendor 0x%04x)", i, p.deviceName, device_type_name(p.deviceType),
+               VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
+               p.driverVersion, p.vendorID);
+        int score = p.apiVersion >= VK_API_VERSION_1_3 ? 2 : 0;
+        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 4;
+        else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score += 1;
+        if (want && *want && ((isdigit((u8)want[0]) && (u32)atoi(want) == i) || strstr(p.deviceName, want))) score += 100;
+        if (score > best_score) {
+            best_score = score;
+            g_dev.phys = pds[i];
             g_dev.props = p;
         }
     }
-    if (!g_dev.phys) hw_fatal("no Vulkan device");
+    if (!g_dev.phys) hw_fatal("No Vulkan GPU found - install or update your GPU driver");
+    if (g_dev.props.apiVersion < VK_API_VERSION_1_3)
+        hw_log("vulkan: WARNING: %s only supports Vulkan %u.%u; HWDER needs 1.3 - update the GPU driver", g_dev.props.deviceName,
+               VK_API_VERSION_MAJOR(g_dev.props.apiVersion), VK_API_VERSION_MINOR(g_dev.props.apiVersion));
     vkGetPhysicalDeviceMemoryProperties(g_dev.phys, &g_dev.mem);
     hw_log("vulkan: %s (api %u.%u)", g_dev.props.deviceName, VK_API_VERSION_MAJOR(g_dev.props.apiVersion),
            VK_API_VERSION_MINOR(g_dev.props.apiVersion));
@@ -269,8 +352,38 @@ static void init_vulkan() {
     f11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
     f11.shaderDrawParameters = VK_TRUE;
     VkPhysicalDeviceFeatures2 feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
-    VkPhysicalDeviceFeatures2 avail{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan13Features a13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features a12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &a13};
+    VkPhysicalDeviceVulkan11Features a11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &a12};
+    VkPhysicalDeviceFeatures2 avail{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &a11};
     vkGetPhysicalDeviceFeatures2(g_dev.phys, &avail);
+    {
+        // Name what the driver lacks instead of failing vkCreateDevice with a bare error code.
+        std::string missing;
+        auto need = [&](VkBool32 have, const char* what) {
+            if (!have) missing += std::string(" ") + what;
+        };
+        need(a13.dynamicRendering, "dynamicRendering");
+        need(a13.synchronization2, "synchronization2");
+        need(a13.maintenance4, "maintenance4");
+        need(a12.shaderInt8, "shaderInt8");
+        need(a12.storageBuffer8BitAccess, "storageBuffer8BitAccess");
+        need(a12.uniformAndStorageBuffer8BitAccess, "uniformAndStorageBuffer8BitAccess");
+        need(a12.scalarBlockLayout, "scalarBlockLayout");
+        need(a12.shaderFloat16, "shaderFloat16");
+        need(a12.timelineSemaphore, "timelineSemaphore");
+        need(a11.storageBuffer16BitAccess, "storageBuffer16BitAccess");
+        need(a11.uniformAndStorageBuffer16BitAccess, "uniformAndStorageBuffer16BitAccess");
+        need(a11.shaderDrawParameters, "shaderDrawParameters");
+        if (a13.shaderDemoteToHelperInvocation) {
+            f13.shaderDemoteToHelperInvocation = VK_TRUE;
+            g_dev.demote_to_helper = true;
+        }
+        if (!missing.empty()) {
+            hw_log("vulkan: %s lacks required features:%s", g_dev.props.deviceName, missing.c_str());
+            hw_fatal("The GPU driver lacks required Vulkan 1.3 features - update the GPU driver (see hwder.log)");
+        }
+    }
     feat.features = avail.features;
     feat.features.robustBufferAccess = VK_FALSE;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feat};
@@ -292,7 +405,7 @@ static void init_vulkan() {
 
 // ------------------------------------------------------------------ presentation
 struct FrameSync {
-    VkSemaphore acquired = VK_NULL_HANDLE, rendered = VK_NULL_HANDLE;
+    VkSemaphore acquired = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
 };
@@ -413,7 +526,6 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
     if (!fs.fence) {
         VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vkCreateSemaphore(g_dev.dev, &sci, nullptr, &fs.acquired);
-        vkCreateSemaphore(g_dev.dev, &sci, nullptr, &fs.rendered);
         VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         vkCreateFence(g_dev.dev, &fci, nullptr, &fs.fence);
@@ -500,11 +612,12 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
     si.pWaitDstStageMask = ws;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &fs.cb;
+    VkSemaphore rendered = g_rendered[idx];
     si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &fs.rendered;
+    si.pSignalSemaphores = &rendered;
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &fs.rendered;
+    pi.pWaitSemaphores = &rendered;
     pi.swapchainCount = 1;
     pi.pSwapchains = &g_swapchain;
     pi.pImageIndices = &idx;

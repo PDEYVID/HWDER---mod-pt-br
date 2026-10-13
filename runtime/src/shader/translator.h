@@ -131,6 +131,7 @@ public:
     void begin_program();
     void prologue();
     void emit_epilogue();
+    void demote();
     void finish_program();
 
     // constant buffers

@@ -37,7 +37,7 @@ Setup
 
 Requirements
 ------------
-- Windows 10/11 x64, a Vulkan 1.2 GPU driver (NVIDIA / AMD / Intel), AVX2 CPU.
+- Windows 10/11 x64, a Vulkan 1.3 GPU driver (NVIDIA / AMD / Intel), AVX2 CPU.
 - Media Foundation (part of Windows; on "N" editions install the Media Feature Pack) for FMVs.
 
 Controls

@@ -236,7 +236,12 @@ void Translator::emit_block_body(const Block& blk) {
         case 3:
             if (op == Op::KIL) {
                 uses_discard = true;
-                b.terminate(spv::OpKill);
+                if (opt.demote_to_helper) {
+                    demote();
+                    b.terminate(spv::OpReturn);
+                } else {
+                    b.terminate(spv::OpKill);
+                }
             } else {
                 emit_epilogue();
                 b.terminate(spv::OpReturn);
@@ -294,7 +299,18 @@ void Translator::emit_kill(Inst in) {
     if (no_kill) return;
     uses_discard = true;
     Id c = guard_cond(in, true);
+    if (opt.demote_to_helper) {
+        // The demoted pixel runs on (its outputs and stores are dropped) so the quad stays complete.
+        if_then(c, [&] { demote(); });
+        return;
+    }
     if_then(c, [&] { b.terminate(spv::OpKill); });
+}
+
+void Translator::demote() {
+    b.capability(spv::CapabilityDemoteToHelperInvocation);
+    b.extension("SPV_EXT_demote_to_helper_invocation");
+    b.op0(spv::OpDemoteToHelperInvocation, {});
 }
 
 void Translator::run() {

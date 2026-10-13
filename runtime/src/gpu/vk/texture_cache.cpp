@@ -547,6 +547,7 @@ void TextureCache::alloc_image(Image* img) {
     if (info.type == ImageType::e2D && info.layers >= 6 && info.width == info.height)
         ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (info.type == ImageType::e3D) ci.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    img->usage = ci.usage;
     VkResult r = vkCreateImage(dev(), &ci, nullptr, &img->image);
     if (r != VK_SUCCESS) {
         hw_log("vk: vkCreateImage failed (%d) fmt %d %ux%ux%u layers %u levels %u", (int)r, (int)ci.format,
@@ -1003,6 +1004,17 @@ VkImageView TextureCache::view(Image* img, VkFormat fmt, VkImageViewType type, u
     ci.format = fmt;
     ci.components = swz;
     ci.subresourceRange = {aspect, base_level, levels, base_layer, layers};
+    // A view inherits the image's usage, which can include usages only another view format supports
+    // (mutable + extended-usage images): drop the ones this view's format lacks (e.g. storage on sRGB).
+    VkImageViewUsageCreateInfo vu{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    if (img->usage) {
+        VkFormatFeatureFlags ff = format_features(fmt);
+        vu.usage = img->usage;
+        if (!(ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) vu.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!(ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) vu.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (!(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) vu.usage &= ~VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (vu.usage != img->usage) ci.pNext = &vu;
+    }
     VkImageView v = VK_NULL_HANDLE;
     VkResult r = vkCreateImageView(dev(), &ci, nullptr, &v);
     if (r != VK_SUCCESS) {
@@ -1013,9 +1025,9 @@ VkImageView TextureCache::view(Image* img, VkFormat fmt, VkImageViewType type, u
     return v;
 }
 
-VkSampler TextureCache::sampler(const u32* tsc) {
+VkSampler TextureCache::sampler(const u32* tsc, bool compare) {
     const int aniso_override = settings::video().aniso;
-    u64 key = hash_bytes(tsc, 32, (u64)aniso_override);
+    u64 key = hash_bytes(tsc, 32, (u64)aniso_override | ((u64)compare << 32));
     auto it = samplers_.find(key);
     if (it != samplers_.end()) return it->second;
     auto wrap = [](u32 w) {
@@ -1032,7 +1044,7 @@ VkSampler TextureCache::sampler(const u32* tsc) {
     ci.addressModeU = wrap(tsc[0] & 7);
     ci.addressModeV = wrap((tsc[0] >> 3) & 7);
     ci.addressModeW = wrap((tsc[0] >> 6) & 7);
-    ci.compareEnable = (tsc[0] >> 9) & 1;
+    ci.compareEnable = compare;
     ci.compareOp = (VkCompareOp)((tsc[0] >> 10) & 7);
     u32 aniso = (tsc[0] >> 20) & 7;
     static const float kAniso[] = {1, 2, 4, 6, 8, 10, 12, 16};

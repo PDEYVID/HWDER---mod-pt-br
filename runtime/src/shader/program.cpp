@@ -192,6 +192,7 @@ Id Translator::load_attribute(u32 addr) {
         u32 i = (addr - 0x80) >> 4;
         Id var = input_generic(i);
         u32 kind = in_generic_kind[i];
+        if (is_vs && comp == 3 && env.attribute_padded(i)) return u(kind == 0 ? 0x3F800000u : 1u);
         Id et = kind == 1 ? t_s32 : kind == 2 ? t_u32 : t_f32;
         Id v = b.load(et, component_ptr(b, spv::StorageClassInput, et, var, u(comp)));
         return et == t_u32 ? v : b.bitcast(t_u32, v);
@@ -251,7 +252,13 @@ void Translator::store_attribute(u32 addr, Id v) {
     if (addr >= 0x2C0 && addr < 0x2E0) {
         if (!clip_distance) {
             b.capability(spv::CapabilityClipDistance);
-            clip_distance = io_var(spv::StorageClassOutput, b.t_array(t_f32, 8), -1, spv::BuiltInClipDistance);
+            // Vulkan clips against every element of the array: the ones the shader never writes must
+            // read 0 (not clipped), not whatever the output register held (AMD: garbage, culls geometry).
+            Id t = b.t_array(t_f32, 8);
+            clip_distance = b.id();
+            b.put(b.globals, spv::OpVariable, {b.t_ptr(spv::StorageClassOutput, t), clip_distance, u32(spv::StorageClassOutput), b.c_null(t)});
+            b.decorate(clip_distance, spv::DecorationBuiltIn, {u32(spv::BuiltInClipDistance)});
+            io_vars.push_back(clip_distance);
         }
         b.store(component_ptr(b, spv::StorageClassOutput, t_f32, clip_distance, u((addr - 0x2C0) >> 2)), bc_f(v));
         return;
@@ -348,8 +355,11 @@ void Translator::prologue() {
         position = io_var(spv::StorageClassOutput, t_v4f, -1, spv::BuiltInPosition);
         b.decorate(position, spv::DecorationInvariant);
         b.store(position, b.c_composite(t_v4f, {fc(0), fc(0), fc(0), fc(1)}));
+        // Declared outputs start as (0,0,0,1) like Maxwell's attribute defaults: components the shader
+        // does not write (or skips on some path) are otherwise undefined, which AMD exposes as garbage.
+        Id def = b.c_composite(t_v4f, {fc(0), fc(0), fc(0), fc(1)});
         for (u32 i = 0; i < 32; i++)
-            if ((sph[0x36 + i / 2] >> ((i & 1) * 4)) & 0xF) output_generic(i);
+            if ((sph[0x36 + i / 2] >> ((i & 1) * 4)) & 0xF) b.store(output_generic(i), def);
     }
     if (is_fs) {
         u32 target = 0, extra = 0;

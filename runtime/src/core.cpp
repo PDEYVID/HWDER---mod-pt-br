@@ -201,51 +201,95 @@ extern "C" void hw_fatal(const char* why) {
     ExitProcess(1);
 }
 
-static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ep) {
+static void report_crash(EXCEPTION_POINTERS* ep) {
     auto* er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && er->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION &&
-        er->ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO && er->ExceptionCode != EXCEPTION_STACK_OVERFLOW)
-        return EXCEPTION_CONTINUE_SEARCH;
     HANDLE proc = GetCurrentProcess();
+    // The symbol handler's module list dates from startup: pick up the DLLs loaded since (the Vulkan
+    // loader, the GPU driver, layers) so their exports resolve.
+    SymRefreshModuleList(proc);
     char symbuf[sizeof(SYMBOL_INFO) + 256] = {};
     auto* sym = (SYMBOL_INFO*)symbuf;
-    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-    sym->MaxNameLen = 255;
-    DWORD64 disp = 0;
-    const char* name = SymFromAddr(proc, (DWORD64)er->ExceptionAddress, &disp, sym) ? sym->Name : "?";
-    auto modname = [](const void* pc, char* out, size_t n) {
+    // "module!symbol+0xN", or "module+0xRVA" when the module has no symbols (driver DLLs): the RVA is
+    // what identifies the crash site in a bug report.
+    auto describe = [&](u64 pc, char* out, size_t n) {
         HMODULE mod = nullptr;
-        strcpy_s(out, n, "?");
+        char mod_name[MAX_PATH] = "?";
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &mod))
-            GetModuleBaseNameA(GetCurrentProcess(), mod, out, (DWORD)n);
+            GetModuleBaseNameA(proc, mod, mod_name, sizeof(mod_name));
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        if (SymFromAddr(proc, pc, &disp, sym) && (!mod || sym->Address >= (u64)mod))
+            snprintf(out, n, "%s!%s+0x%llx", mod_name, sym->Name, (unsigned long long)disp);
+        else if (mod)
+            snprintf(out, n, "%s+0x%llx", mod_name, (unsigned long long)(pc - (u64)mod));
+        else
+            snprintf(out, n, "?+0x%llx", (unsigned long long)pc);
     };
-    char mn[MAX_PATH];
-    modname(er->ExceptionAddress, mn, sizeof(mn));
+    char where[512];
+    describe((u64)er->ExceptionAddress, where, sizeof(where));
     PWSTR tdesc = nullptr;
     GetThreadDescription(GetCurrentThread(), &tdesc);
-    hw_log("CRASH code=0x%08lx at %p (%s!%s+0x%llx) access=%s 0x%llx (thread %lu %ls)", er->ExceptionCode,
-           er->ExceptionAddress, mn, name, (unsigned long long)disp,
+    hw_log("CRASH code=0x%08lx at %p (%s) access=%s 0x%llx (thread %lu %ls)", er->ExceptionCode, er->ExceptionAddress, where,
            er->NumberParameters > 0 && er->ExceptionInformation[0] ? "write" : "read",
            er->NumberParameters > 1 ? (unsigned long long)er->ExceptionInformation[1] : 0ull, GetCurrentThreadId(), tdesc ? tdesc : L"");
+    // Unwind with the OS's own unwind tables (present in every x64 module, symbols or not); StackWalk64
+    // stops at the first module dbghelp does not know.
     CONTEXT ctx = *ep->ContextRecord;
-    STACKFRAME64 sf = {};
-    sf.AddrPC.Offset = ctx.Rip;
-    sf.AddrPC.Mode = AddrModeFlat;
-    sf.AddrFrame.Offset = ctx.Rbp;
-    sf.AddrFrame.Mode = AddrModeFlat;
-    sf.AddrStack.Offset = ctx.Rsp;
-    sf.AddrStack.Mode = AddrModeFlat;
-    for (int i = 0; i < 40; i++) {
-        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &ctx, nullptr,
-                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || !sf.AddrPC.Offset)
-            break;
-        disp = 0;
-        const char* n = SymFromAddr(proc, sf.AddrPC.Offset, &disp, sym) ? sym->Name : "?";
-        char fm[MAX_PATH];
-        modname((const void*)sf.AddrPC.Offset, fm, sizeof(fm));
-        hw_log("  #%02d %s!%s+0x%llx", i, fm, n, (unsigned long long)disp);
+    for (int i = 0; i < 40 && ctx.Rip; i++) {
+        char fr[512];
+        describe(ctx.Rip, fr, sizeof(fr));
+        hw_log("  #%02d %s", i, fr);
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        if (fn) {
+            void* handler_data = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+        } else {
+            // Leaf function: the return address is at [rsp].
+            if (!ctx.Rsp || IsBadReadPtr((const void*)ctx.Rsp, 8)) break;
+            ctx.Rip = *(DWORD64*)ctx.Rsp;
+            ctx.Rsp += 8;
+        }
     }
     ExitProcess(2);
+}
+
+static bool is_fatal_code(DWORD code) {
+    return code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+           code == EXCEPTION_STACK_OVERFLOW;
+}
+
+// First chance: faults in our own image (runtime + recompiled game code) are fatal right away. A fault
+// inside another module (the Vulkan loader, the GPU driver, an overlay layer) can be one that module
+// raises on purpose and catches with its own __try/__except - AMD's driver does this on the renderer
+// thread - so it must reach the module's handler. If nothing handles it, unhandled_filter reports it.
+static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ep) {
+    auto* er = ep->ExceptionRecord;
+    if (!is_fatal_code(er->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+    if (er->ExceptionCode != EXCEPTION_STACK_OVERFLOW) {
+        HMODULE mod = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)er->ExceptionAddress, &mod);
+        if (mod && mod != GetModuleHandleW(nullptr)) {
+            static std::atomic<int> logged{0};
+            if (logged++ < 8) {
+                char mn[MAX_PATH] = "?";
+                GetModuleBaseNameA(GetCurrentProcess(), mod, mn, sizeof(mn));
+                hw_log("first-chance exception 0x%08lx in %s+0x%llx (thread %lu), left to the module's handler", er->ExceptionCode,
+                       mn, (unsigned long long)((u64)er->ExceptionAddress - (u64)mod), GetCurrentThreadId());
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+    report_crash(ep);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* ep) {
+    report_crash(ep);
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 // Log the calling thread's host stack (guest functions appear as f_<addr>).
@@ -448,6 +492,7 @@ int main(int argc, char** argv) {
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
     SymInitialize(GetCurrentProcess(), nullptr, TRUE);
     AddVectoredExceptionHandler(1, crash_handler);
+    SetUnhandledExceptionFilter(unhandled_filter);
     // Deaths that bypass SEH: C++ terminate (uncaught exception, e.g. in a worker thread), abort(),
     // CRT invalid-parameter. Log them with the thread id instead of dying silently.
     std::set_terminate([] {
