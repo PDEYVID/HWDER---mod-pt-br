@@ -37,5 +37,8 @@ void set_status(const std::string& s);
 void set_output_hz(double hz);
 void client_size(unsigned* w, unsigned* h);  // current swapchain / window client size (0 if none yet)
 double monitor_hz();
+// The game's frame rate: its vsync event and the presenter's grid. 60 as on the console;
+// HWDER_PATCH_DT=<hz> (which also rewrites the game's time step) runs the game loop at that rate.
+double game_hz();
 
 }  // namespace display

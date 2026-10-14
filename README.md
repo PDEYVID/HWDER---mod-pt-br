@@ -24,9 +24,9 @@ of your own `.nsp` with your own `prod.keys` at run time. Nothing is extracted t
 Requirements: Windows 10/11 x64, a Vulkan 1.3 driver (NVIDIA, AMD, Intel), an AVX2 CPU, and
 Media Foundation (built into Windows; "N" editions need the Media Feature Pack) for the movies.
 
-In game: **F1** opens the options overlay (internal resolution scale, unlocked resolution for
-ultrawide, vsync, borderless, anisotropic filtering, FPS counter, 60 Hz monitor switch, and a
-save-file cheats tab). **F11** toggles borderless fullscreen. Any XInput controller works;
+In game: **F1** opens the options overlay (frame interpolation for 120/144 Hz displays, internal
+resolution scale, unlocked resolution for ultrawide, vsync, borderless, anisotropic filtering, FPS
+counter, 60 Hz monitor switch, and a save-file cheats tab). **F11** toggles borderless fullscreen. Any XInput controller works;
 keyboard: WASD move, arrows camera, K/Enter = A, J/Backspace = B, I = X, L = Y, Q/E = L/R,
 U/O = ZL/ZR, Space = +, Tab = -, 1-4 = D-pad, Z/C = stick clicks.
 
@@ -217,7 +217,20 @@ log file; `HWDER_MUTE=1` silences audio; `HWDER_RES_SCALE` overrides the resolut
 `HWDER_VALIDATION=1` enables Vulkan validation layers (messages go to `hwder.log`); `HWDER_GPU=<index or
 part of the name>` picks the GPU on multi-GPU systems (the log lists them); `HWDER_EMULATE_AMD=1` makes the
 renderer treat the formats AMD drivers lack (D24S8 depth, 3-component vertex formats) as unsupported, to
-exercise those fallbacks on other GPUs; `HWDER_VK_FRAME_DUMP`, `HWDER_GPU_TRACE`,
+exercise those fallbacks on other GPUs; `HWDER_INTERP=<hz>` forces frame interpolation.
+
+Performance work: `HWDER_HEADLESS=1` renders and paces everything but presents nothing (window
+presentation can cost tens of ms on hybrid-graphics laptops and hide the game's own timing);
+`HWDER_OFFSCREEN=1` parks the window off-screen (`=corner`: a small window in the screen corner);
+`HWDER_AUTOPLAY=2` drives the input into a battle and keeps fighting (`HWDER_AUTOPLAY_IDLE=1`: no input
+once in battle); `HWDER_PROFILE_MS=<ms>` logs the renderer's per-phase profile of frames above that cost;
+`HWDER_SAMPLE=<thread name part>` (`*` = all) runs a sampling profiler over matching threads;
+`HWDER_SVC_ACCT=1` logs per guest thread the time spent in each system call; `HWDER_SLEEP_TRACE=1`,
+`HWDER_WAIT_TRACE=<ms>`, `HWDER_KLOCK_TRACE=1` and `HWDER_CPU_TRACE=1` trace sleeps, long waits, kernel
+lock holds and system-wide CPU use. Run timing tests from a folder outside an editor's workspace: code
+indexers re-scanning the repository when the game writes files saturate the CPU for seconds.
+
+`HWDER_VK_FRAME_DUMP`, `HWDER_GPU_TRACE`,
 `HWDER_IPC_TRACE`, `HWDER_FS_TRACE` and the other `HWDER_*_TRACE` switches dump the respective
 subsystem's activity to the log.
 

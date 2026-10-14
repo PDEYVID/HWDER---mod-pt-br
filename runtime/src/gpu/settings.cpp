@@ -43,9 +43,10 @@ void load() {
         else if (k == "unlocked_res") g_video.unlocked_res = atoi(v) != 0;
         else if (k == "show_fps") g_video.show_fps = atoi(v) != 0;
         else if (k == "display_60hz") g_video.display_60hz = atoi(v) != 0;
-        else if (k == "interp_hz") g_video.interp_hz = 0;  // frame interpolation is stubbed out (too janky); HWDER_INTERP=<hz> re-enables it for experiments
+        else if (k == "interp_hz") g_video.interp_hz = atoi(v);
     }
     fclose(f);
+    if (g_video.interp_hz != 0) g_video.display_60hz = false;  // interpolation needs the panel's own refresh
 }
 
 void save() {

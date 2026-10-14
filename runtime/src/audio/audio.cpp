@@ -57,14 +57,41 @@ struct OutputRing {
 };
 static OutputRing g_ring;
 
+// Logs audio work that takes longer than 10 ms (the renderer ticks every 5 ms).
+struct SlowScope {
+    const char* what;
+    LARGE_INTEGER a;
+    explicit SlowScope(const char* w) : what(w) { QueryPerformanceCounter(&a); }
+    ~SlowScope() {
+        LARGE_INTEGER b, f;
+        QueryPerformanceCounter(&b);
+        QueryPerformanceFrequency(&f);
+        double ms = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+        if (ms > 10.0) hw_log("audio: slow: %s took %.1f ms", what, ms);
+    }
+};
+
 static void wasapi_thread() {
     SetThreadDescription(GetCurrentThread(), L"HWDER audio out");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (getenv("HWDER_MUTE")) {  // test runs: never open the output device
         hw_log("audio: muted (HWDER_MUTE) - output disabled");
+        // Consume at the real 48 kHz rate, by elapsed time: a fixed 256 frames per Sleep(5) (which lasts
+        // 5-6 ms) played slow, the ring filled up and the game's audio clock drifted from a real device's.
+        LARGE_INTEGER f, t0, now;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        u64 consumed = 0;
         for (;;) {
-            s16 sink[1024];
-            g_ring.pop(sink, 256);
-            Sleep(5);
+            Sleep(2);
+            QueryPerformanceCounter(&now);
+            u64 due = (u64)((now.QuadPart - t0.QuadPart) * 48000 / f.QuadPart);
+            while (consumed < due) {
+                s16 sink[2048];
+                u32 n = (u32)std::min<u64>(due - consumed, 1024);
+                g_ring.pop(sink, n);  // frames short of `n` are an underrun, as on a real device
+                consumed += n;
+            }
         }
     }
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -297,6 +324,7 @@ public:
 
     // One RequestUpdate: parse input sections in order, write statuses.
     Result update(const u8* in, u64 in_size, u8* out, u64 out_size) {
+        SlowScope ss("RequestUpdate (incl. lock wait)");
         std::lock_guard<std::mutex> l(m_);
         if (in_size < sizeof(UpdateHeader)) return ModuleResult(153, 4);
         UpdateHeader h;
@@ -459,6 +487,7 @@ public:
 
     // Render one frame into `out` (stereo s16 at params.sample_rate).
     void render(s16* out) {
+        SlowScope ss("render (incl. lock wait)");
         std::lock_guard<std::mutex> l(m_);
         u32 n = params_.sample_count;
         std::fill(mix_buffers_.begin(), mix_buffers_.end(), 0.0f);
@@ -760,6 +789,9 @@ static std::vector<std::shared_ptr<Renderer>> g_renderers;
 
 static void audio_thread() {
     SetThreadDescription(GetCurrentThread(), L"HWDER audio render");
+    // The game paces itself on audio time (its update events): a late audio tick stalls the game's
+    // frames. This thread must never lose the CPU to busy game or renderer threads.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     LARGE_INTEGER freq, next, now;
     QueryPerformanceFrequency(&freq);
@@ -808,8 +840,12 @@ static void audio_thread() {
             due.QuadPart = -(wait * 10000000 / freq.QuadPart);
             SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0);
             WaitForSingleObject(timer, INFINITE);
-        } else if (wait < -period_ticks * 8) {
-            next = now;  // fell far behind: resync rather than burst
+        } else if (wait < -period_ticks * 40) {
+            // Hopelessly behind (>200 ms, e.g. the process was suspended): resync. Smaller lags are caught
+            // up by rendering the missed ticks back to back - dropping them lost audio time, and the
+            // game, which waits for audio progress, stalled for as long.
+            hw_log("audio: renderer fell %.0f ms behind - resync", -wait * 1000.0 / freq.QuadPart);
+            next = now;
         }
     }
 }

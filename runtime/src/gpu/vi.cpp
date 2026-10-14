@@ -5,6 +5,7 @@
 #include <mutex>
 #include <thread>
 
+#include "display.h"
 #include "gpu.h"
 #include "nvdrv_device.h"
 #include "service/common.h"
@@ -352,7 +353,13 @@ private:
             // Wait for rendering into the buffer to finish. Never present an unfinished buffer: when the GPU
             // thread stalls for more than a second (shader builds, first-time ASTC decodes, frame dumps) a
             // bounded wait would show half-drawn frames (UI layers without their text, clear-colour flashes).
+            LARGE_INTEGER cf, c0, c1;
+            QueryPerformanceFrequency(&cf);
+            QueryPerformanceCounter(&c0);
             for (u32 i = 0; i < std::min<u32>(q.in.fence.num_fences, 4); i++) {
+                u32 before = nv::syncpoint_read(q.in.fence.fences[i].id);
+                LARGE_INTEGER w0, w1;
+                QueryPerformanceCounter(&w0);
                 int waited = 0;
                 while (!nv::syncpoint_wait(q.in.fence.fences[i].id, q.in.fence.fences[i].value, 1000000000ll)) {
                     if (++waited == 1 || waited % 10 == 0)
@@ -360,6 +367,11 @@ private:
                                q.in.fence.fences[i].value, waited, nv::syncpoint_read(q.in.fence.fences[i].id));
                     if (waited >= 30) break;  // escape hatch for a wedged GPU thread
                 }
+                QueryPerformanceCounter(&w1);
+                double ms = (w1.QuadPart - w0.QuadPart) * 1000.0 / cf.QuadPart;
+                if (ms > 50.0)
+                    hw_log("vi: slow: frame fence %u:%u took %.0f ms (value was %u)", q.in.fence.fences[i].id, q.in.fence.fences[i].value,
+                           ms, before);
             }
             gpu::FramebufferInfo fb;
             fb.address = nv::nvmap_address(gb.nvmap_handle) + gb.offset;
@@ -378,6 +390,9 @@ private:
             fb.crop_bottom = q.in.crop_bottom;
             fb.swap_interval = q.in.swap_interval ? q.in.swap_interval : 1;
             if (fb.address) gpu::renderer()->present(fb);
+            QueryPerformanceCounter(&c1);
+            if ((c1.QuadPart - c0.QuadPart) * 1000.0 / cf.QuadPart > 50.0)
+                hw_log("vi: slow: compositing a frame took %.0f ms", (c1.QuadPart - c0.QuadPart) * 1000.0 / cf.QuadPart);
             {
                 std::lock_guard<std::mutex> l(m_);
                 if (presented >= 0 && presented != q.slot && slots_[presented].state == SlotState::Acquired)
@@ -421,7 +436,7 @@ std::shared_ptr<ReadableEvent> vsync_event() {
             LARGE_INTEGER freq, next, now;
             QueryPerformanceFrequency(&freq);
             QueryPerformanceCounter(&next);
-            const s64 period = freq.QuadPart / 60;
+            const s64 period = (s64)(freq.QuadPart / display::game_hz());
             for (;;) {
                 next.QuadPart += period;
                 QueryPerformanceCounter(&now);

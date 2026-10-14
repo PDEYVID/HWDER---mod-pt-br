@@ -18,6 +18,27 @@ HandleTable g_handles;
 ProcessInfo g_process;
 
 // ------------------------------------------------------------------ lock
+// HWDER_KLOCK_TRACE=1: log every hold of the kernel lock longer than 5 ms (holder, SVC it was in).
+thread_local u32 t_current_svc = 0xFFFF;
+static const bool g_klock_trace = getenv("HWDER_KLOCK_TRACE") != nullptr;
+static u64 g_klock_since = 0;
+static void klock_held(u64 since) {
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    double ms = (now.QuadPart - (s64)since) * 1000.0 / f.QuadPart;
+    if (ms > 5.0) {
+        Thread* t = current_thread();
+        hw_log("kernel: lock held %.1f ms by thread %llu (host %lu) in svc 0x%x", ms, t ? (unsigned long long)t->id : 0ull,
+               GetCurrentThreadId(), t_current_svc);
+    }
+}
+static u64 klock_now() {
+    LARGE_INTEGER n;
+    QueryPerformanceCounter(&n);
+    return (u64)n.QuadPart;
+}
+
 void KernelLock::lock() {
     u32 self = GetCurrentThreadId();
     if (owner_.load(std::memory_order_relaxed) == self) {
@@ -27,15 +48,18 @@ void KernelLock::lock() {
     m_.lock();
     owner_.store(self, std::memory_order_relaxed);
     depth_ = 1;
+    if (g_klock_trace) g_klock_since = klock_now();
 }
 void KernelLock::unlock() {
     if (--depth_ == 0) {
+        if (g_klock_trace) klock_held(g_klock_since);
         owner_.store(0, std::memory_order_relaxed);
         m_.unlock();
     }
 }
 int KernelLock::release_all() {
     int d = depth_;
+    if (g_klock_trace) klock_held(g_klock_since);
     depth_ = 0;
     owner_.store(0, std::memory_order_relaxed);
     m_.unlock();
@@ -45,6 +69,7 @@ void KernelLock::reacquire(int depth) {
     m_.lock();
     owner_.store(GetCurrentThreadId(), std::memory_order_relaxed);
     depth_ = depth;
+    if (g_klock_trace) g_klock_since = klock_now();
 }
 
 // ------------------------------------------------------------------ handles
@@ -98,6 +123,12 @@ std::vector<std::shared_ptr<Thread>> all_threads() {
 static DWORD WINAPI thread_main(void* p) {
     Thread* t = (Thread*)p;
     t_current = t;
+    {
+        // Named for crash reports and the sampling profiler (HWDER_SAMPLE=guest).
+        wchar_t name[48];
+        swprintf(name, 48, L"guest %llu prio %d core %d", (unsigned long long)t->id, t->priority, t->ideal_core);
+        SetThreadDescription(GetCurrentThread(), name);
+    }
     Ctx* c = t->ctx;
     hw_ctx_bind(c);
     c->x[0] = t->arg;
@@ -426,10 +457,12 @@ Result wait_synchronization(const Handle* handles, s32 count, s64 timeout_ns, s3
     Result r = wait_synchronization_impl(handles, count, timeout_ns, out_index);
     QueryPerformanceCounter(&b);
     double ms = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
-    static const bool trace = getenv("HWDER_WAIT_TRACE") != nullptr;
-    if (trace && ms > 150.0) {
+    // HWDER_WAIT_TRACE=<ms> (default 150): log guest waits longer than that.
+    static const double trace_ms = getenv("HWDER_WAIT_TRACE") ? std::max(1.0, atof(getenv("HWDER_WAIT_TRACE"))) : 0.0;
+    if (trace_ms > 0 && ms > (trace_ms > 1.0 ? trace_ms : 150.0)) {
         ObjectPtr o = g_handles.get(handles[0]);
-        hw_log("kernel: wait on %d handle(s) [0x%x %s %p%s] took %.0f ms (timeout %lld ms, result 0x%x, index %d)", count,
+        hw_log("kernel: thread %llu wait on %d handle(s) [0x%x %s %p%s] took %.0f ms (timeout %lld ms, result 0x%x, index %d)",
+               current_thread() ? (unsigned long long)current_thread()->id : 0ull, count,
                handles[0], o ? o->type_name() : "?", (void*)o.get(), count > 1 ? ", ..." : "", ms,
                (long long)(timeout_ns < 0 ? -1 : timeout_ns / 1000000), r, *out_index);
     }

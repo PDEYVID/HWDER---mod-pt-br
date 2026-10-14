@@ -124,12 +124,24 @@ static void window_thread() {
     // HWDER_OFFSCREEN=1: a normal visible window (real swapchain, real presents) parked beyond the
     // desktop edge and never activated, so automated runs exercise the present path without
     // appearing on the user's screen or taking their focus.
-    const bool offscreen = getenv("HWDER_OFFSCREEN") != nullptr;
+    const char* offscreen_env = getenv("HWDER_OFFSCREEN");
+    const bool offscreen = offscreen_env != nullptr;
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     if (offscreen) {
         RECT vd{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
         x = vd.left + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64;  // right of every monitor
         y = vd.top + 64;
+        // HWDER_OFFSCREEN=corner: a small window in the primary monitor's bottom-right corner instead.
+        // A window outside every monitor presents very slowly on some laptops (hybrid graphics), which
+        // makes timing measurements meaningless.
+        if (!strcmp(offscreen_env, "corner")) {
+            r = {0, 0, 480, 270};
+            AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+            RECT wa;
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            x = wa.right - (r.right - r.left);
+            y = wa.bottom - (r.bottom - r.top);
+        }
     }
     g_hwnd = CreateWindowExW(offscreen ? WS_EX_NOACTIVATE : 0, L"HWDER", L"Hyrule Warriors: Definitive Edition (HWDER)",
                              WS_OVERLAPPEDWINDOW, x, y, r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance,
@@ -427,6 +439,15 @@ double monitor_hz() {
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) return (double)dm.dmDisplayFrequency;
     return 60.0;
 }
+double game_hz() {
+    static const double hz = [] {
+        const char* e = getenv("HWDER_PATCH_DT");
+        double v = e ? atof(e) : 0.0;
+        return v >= 30.0 ? v : 60.0;
+    }();
+    return hz;
+}
+
 static void frame_limit(u32 interval) {
     static LARGE_INTEGER freq, next;
     static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -437,7 +458,7 @@ static void frame_limit(u32 interval) {
     // limiter to 30 fps (the title screen alternates 1/2 every second, which made that stutter).
     // The game is frame-locked (its logic advances per released frame), so the release grid stays at
     // 60 Hz whatever the display runs at; HWDER_FPS exists only for experiments.
-    double fps = env ? atof(env) : (g_output_hz > 0 ? g_output_hz : 60.0);
+    double fps = env ? atof(env) : (g_output_hz > 0 ? g_output_hz : game_hz());
     static u32 last_interval = 0;
     if (interval != last_interval) {
         last_interval = interval;
@@ -458,17 +479,14 @@ static void frame_limit(u32 interval) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     s64 period = (s64)(freq.QuadPart / fps);
-    // `next` is the virtual vblank grid. In steady state we arrive here a little after the grid point
-    // (the game produced its frame right after we released the previous buffer). After a real stall
-    // (debt beyond a quarter period) re-anchor the grid to now instead of letting several presents
-    // burst through at zero wait: a display never shows frames faster than its refresh, and the frame
-    // after a hitch should again stay up for a full period.
+    // `next` is when the previous frame was released; this one may go out `slots` periods later. A frame
+    // that arrives after its slot is released at once and the grid re-anchors to it, so the following
+    // frame again stays up a full period (a display never shows frames faster than its refresh). The
+    // grid used to re-anchor to now + one period here, which made the frame after every late one wait
+    // two periods: heavy scenes alternated 17/33 ms frames.
     g_trace_overshoot_ms = 0;
-    if (!next.QuadPart || now.QuadPart - next.QuadPart > period / 4) {
-        // Late frame: show it immediately (never add a full period of latency to a frame that is
-        // already late - when the game runs slower than the grid that would cost 16 ms on EVERY
-        // frame) but anchor the grid so the following frame still stays up for a whole period.
-        next.QuadPart = now.QuadPart + period * slots;
+    if (!next.QuadPart || now.QuadPart >= next.QuadPart + period * (s64)slots) {
+        next = now;
         return;
     }
     next.QuadPart += period * slots;
@@ -570,6 +588,13 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
     VkImageSubresourceRange rr{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(fs.cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &bg, 1, &rr);
     if (src) {
+        // The clear and the blit both write the swapchain image: without this barrier they are a
+        // write-after-write hazard, and on AMD the clear landed after the blit in some 64x64 tiles -
+        // black boxes on the presented picture (issue #2; found by Zucchyny63's frame dumps).
+        b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(fs.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
         float s = std::min((float)g_extent.width / w, (float)g_extent.height / h);
         s32 dw = (s32)(w * s), dh = (s32)(h * s);
         s32 x0 = ((s32)g_extent.width - dw) / 2, y0 = ((s32)g_extent.height - dh) / 2;
@@ -671,7 +696,20 @@ void present_image(VkImage image, u32 width, u32 height, u32 swap_interval, VkSe
     // interpolation replays) overlaps the wait instead of delaying the present.
     frame_limit(swap_interval);
     QueryPerformanceCounter(&t1);
-    present(image, width, height, black, wait_sem, wait_value);
+    // HWDER_HEADLESS=1 (testing): everything is rendered and paced, but nothing is shown. Presenting a
+    // window costs ~40 ms per frame on some hybrid-graphics laptops, which hides the game's own timing.
+    static const bool headless = getenv("HWDER_HEADLESS") != nullptr;
+    if (headless) {
+        if (wait_sem) {
+            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &wait_sem;
+            wi.pValues = &wait_value;
+            vkWaitSemaphores(g_dev.dev, &wi, 1000000000ull);  // as a present would: the frame is finished
+        }
+    } else {
+        present(image, width, height, black, wait_sem, wait_value);
+    }
     update_title(true);
     QueryPerformanceCounter(&t2);
     g_limiter_ms += (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
@@ -732,10 +770,13 @@ void init() {
     init_vulkan();
     overlay::init(g_hwnd, g_dev.instance, g_dev.phys, g_dev.dev, g_dev.queue_family, g_dev.present_queue, VK_FORMAT_B8G8R8A8_UNORM);
     if (!g_images.empty()) overlay::on_swapchain(g_images, VK_FORMAT_B8G8R8A8_UNORM);
-    if (settings::video().display_60hz) PostMessageW(g_hwnd, overlay::kMsgDisplay60, 0, 1);
-    if (settings::video().borderless) PostMessageW(g_hwnd, overlay::kMsgBorderless, 0, 1);
-    else if (settings::video().window_w && settings::video().window_h)
-        PostMessageW(g_hwnd, overlay::kMsgClientSize, 0, (LPARAM)((settings::video().window_w << 16) | settings::video().window_h));
+    // Test windows (HWDER_OFFSCREEN) stay where they were put: no fullscreen, resize or refresh switch.
+    if (!getenv("HWDER_OFFSCREEN")) {
+        if (settings::video().display_60hz) PostMessageW(g_hwnd, overlay::kMsgDisplay60, 0, 1);
+        if (settings::video().borderless) PostMessageW(g_hwnd, overlay::kMsgBorderless, 0, 1);
+        else if (settings::video().window_w && settings::video().window_h)
+            PostMessageW(g_hwnd, overlay::kMsgClientSize, 0, (LPARAM)((settings::video().window_w << 16) | settings::video().window_h));
+    }
     std::thread(boot_screen_thread).detach();
     hw_log("display: window open");
 }

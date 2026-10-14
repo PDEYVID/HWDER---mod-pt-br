@@ -102,6 +102,7 @@ struct Frame {
     u32 dpool_index = 0;
     std::vector<std::function<void()>> deferred;
     u64 serial = 0;
+    u64 submit_tsc = 0;  // when submitted (GPU latency diagnostics)
 };
 
 struct Sched {
@@ -185,6 +186,17 @@ void waiter_thread() {
             f = g_s.in_flight.front();
         }
         wait_serial(f->serial);
+        if (f->submit_tsc) {
+            // Submit-to-completion time of one command buffer: the GPU's own load (plus queueing).
+            static u64 n = 0, worst_us = 0, sum_us = 0;
+            u64 us = (u64)((double)(__rdtsc() - f->submit_tsc) * tsc_ms_per_tick() * 1000.0);
+            if (us > 100000) hw_log("vk: slow: GPU took %llu ms to finish command buffer %llu", (unsigned long long)(us / 1000), (unsigned long long)f->serial);
+            n++, sum_us += us, worst_us = std::max(worst_us, us);
+            if (n == 600) {
+                hw_log("vk: GPU completion latency: avg %.1f ms, worst %.1f ms (last 600 command buffers)", sum_us / 600000.0, worst_us / 1000.0);
+                n = sum_us = worst_us = 0;
+            }
+        }
         u64 v = 0;
         vkGetSemaphoreCounterValue(dev(), g_s.timeline, &v);
         for (auto& fn : f->deferred) fn();
@@ -319,6 +331,7 @@ void Recorder::flush() {
     {
         SlowTimer timer("vkQueueSubmit", 30.0);
         std::lock_guard<std::mutex> q(display::device().queue_lock);
+        f->submit_tsc = __rdtsc();
         VkResult r = vkQueueSubmit(display::device().queue, 1, &si, VK_NULL_HANDLE);
         if (r != VK_SUCCESS) {
             hw_log("vk: vkQueueSubmit failed %d", (int)r);
@@ -613,6 +626,9 @@ struct Framebuffer {
     }
 };
 
+// Draws in the last presented frame (read by the HWDER_AUTOPLAY=2 input script to tell battle from menus).
+extern "C" std::atomic<u32> hw_last_frame_draws{0};
+
 static const char* kPipelineCacheFile = "pipeline_cache.bin";
 static const u64 g_start_ms = GetTickCount64();
 
@@ -807,6 +823,7 @@ private:
         s32 vertex_offset;
         u8 color_mask[8];
         bool depth_write;
+        bool depth_test;  // 3D geometry: the only draws whose constants are interpolated
         u64 match_key;  // program + guest vertex/index addresses + counts
     };
     struct ClearRec {
@@ -836,7 +853,7 @@ private:
     u32 pass_written_ = 0;
     std::vector<OpRec> rec_cur_, rec_prev_;
     u64 rec_destroy_count_ = 0, frame_first_serial_ = 0;
-    double interp_acc_ = 0;
+    double interp_phase_ = 0;  // position of the next interpolated output within the game frame window (0..1]
     bool prev_unsafe_ = false;
     VkImage saved_img_ = VK_NULL_HANDLE;
     VkDeviceMemory saved_mem_ = VK_NULL_HANDLE;
@@ -2807,6 +2824,7 @@ void VkRenderer::do_draw(const u32* regs, const DrawParams& p, const void* inlin
         d.vertex_offset = vertex_offset;
         for (u32 i = 0; i < 8; i++) d.color_mask[i] = key.color_mask[i];
         d.depth_write = key.depth_write || key.stencil_enable;
+        d.depth_test = fb.depth_view && key.depth_test;
         u64 kw[5] = {prog_key, addr(regs, VertexStreams + 1), addr(regs, IndexBuffer), ((u64)p.count << 32) | p.first, p.topology};
         d.match_key = hash_bytes(kw, sizeof(kw), 0x1e1e);
     }
@@ -3098,12 +3116,39 @@ void VkRenderer::replay_draw(const DrawRec& d, const DrawRec* prev, float t) {
     }
 }
 
+// How different two draws' vertex-stage constants are (world matrices, bone palettes): the sum of
+// absolute float differences over the first 48 floats, non-floats counted as a fixed penalty.
+static double cbuf_distance(const std::vector<u8>& a, const std::vector<u8>& b) {
+    size_t n = std::min(a.size(), b.size()) / 4;
+    n = std::min<size_t>(n, 48);  // per-object transforms come first; keeps big groups cheap
+    double d = 0;
+    for (size_t i = 0; i < n; i++) {
+        float fa, fb;
+        memcpy(&fa, a.data() + i * 4, 4);
+        memcpy(&fb, b.data() + i * 4, 4);
+        if (!std::isfinite(fa) || !std::isfinite(fb)) {
+            d += fa == fb ? 0 : 1e6;
+            continue;
+        }
+        d += std::min(1e6, (double)fabsf(fa - fb));
+    }
+    return d + (a.size() != b.size() ? 1e9 : 0);
+}
+
 void VkRenderer::replay_frame(float t) {
-    // match draws of the previous frame by signature, in order of occurrence
+    // Match draws of the previous frame by signature. Identical objects (a crowd of the same enemy)
+    // share a signature, and the game re-sorts them every frame: pair each draw with the unused
+    // previous draw whose vertex-stage constants are closest (its own position), not by order -
+    // pairing by order blended different enemies and left ghosts halfway between them.
     std::unordered_map<u64, std::vector<const DrawRec*>> prev_by_key;
     for (const OpRec& o : rec_prev_)
         if (!o.is_clear) prev_by_key[o.draw.match_key].push_back(&o.draw);
-    std::unordered_map<u64, u32> used;
+    std::unordered_map<const DrawRec*, bool> used;
+    auto vs_cbufs = [](const DrawRec& d) -> const std::vector<CbufRec>* {
+        for (u32 s = 0; s < 2; s++)
+            if (d.has_stage[s] && !d.stages[s].cbufs.empty()) return &d.stages[s].cbufs;
+        return nullptr;
+    };
     sync_shadows(rec_frame_);
     for (const OpRec& o : rec_frame_) {
         if (o.is_clear) {
@@ -3112,9 +3157,28 @@ void VkRenderer::replay_frame(float t) {
         }
         const DrawRec* prev = nullptr;
         auto it = prev_by_key.find(o.draw.match_key);
-        if (it != prev_by_key.end()) {
-            u32& n = used[o.draw.match_key];
-            if (n < it->second.size()) prev = it->second[n++];
+        // 2D (UI, text, post-process) is drawn exactly as in the new frame: its draws reuse vertex
+        // buffers and programs from element to element, so a "match" in the previous frame is often a
+        // different element, and blending toward it threw UI pieces across the screen.
+        if (it != prev_by_key.end() && o.draw.depth_test) {
+            const auto& cands = it->second;
+            const std::vector<CbufRec>* mine = vs_cbufs(o.draw);
+            double best_d = 1e300;
+            for (const DrawRec* c : cands) {
+                if (used[c] || !c->depth_test) continue;
+                double dist = 0;
+                const std::vector<CbufRec>* theirs = vs_cbufs(*c);
+                if (cands.size() > 1 && mine && theirs) {
+                    for (size_t k = 0; k < std::min(mine->size(), theirs->size()); k++)
+                        dist += cbuf_distance((*mine)[k].data, (*theirs)[k].data);
+                }
+                if (dist < best_d) {
+                    best_d = dist;
+                    prev = c;
+                    if (cands.size() == 1 || dist == 0) break;
+                }
+            }
+            if (prev) used[prev] = true;
         }
         replay_draw(o.draw, prev, t);
     }
@@ -3437,7 +3501,8 @@ static void write_image_bmp(VkImage image, u32 w, u32 h, VkFormat fmt, const cha
 // HWDER_FILMSTRIP=<dir>: a 96x54 thumbnail of every presented frame (f_<present>.raw RGBA8 + index.txt),
 // read back two presents later so it never stalls. For frame-by-frame inspection of transitions/cadence.
 static void filmstrip_capture(VkImage src, u32 w, u32 h, const char* dir) {
-    constexpr u32 SW = 96, SH = 54;
+    // HWDER_FILMSTRIP_W=<width> (default 96): thumbnail width, 16:9.
+    static const u32 SW = getenv("HWDER_FILMSTRIP_W") ? std::max(16, atoi(getenv("HWDER_FILMSTRIP_W"))) : 96, SH = SW * 9 / 16;
     static VkImage simg = VK_NULL_HANDLE;
     static VkDeviceMemory smem = VK_NULL_HANDLE;
     static Buffer bufs[3];
@@ -3615,6 +3680,11 @@ void VkRenderer::present(const FramebufferInfo& fb) {
         pres_fmt_ = img->info.fmt.vk;
         g_rec.flush();
         g_s.present_count++;
+        {
+            static u64 draws_at_last = 0;
+            hw_last_frame_draws = (u32)(draws_ - draws_at_last);
+            draws_at_last = draws_;
+        }
         {   // F1 menu changed the internal resolution: apply between frames
             static const bool env_scale = getenv("HWDER_RES_SCALE") || getenv("HWDER_RES_SCALE_X") || getenv("HWDER_RES_SCALE_Y");
             if (!env_scale) {
@@ -3715,10 +3785,18 @@ void VkRenderer::present(const FramebufferInfo& fb) {
         // ---- frame interpolation: k outputs per game frame at the display rate
         display::set_output_hz(out_hz);
         u32 iv = std::max(1u, fb.swap_interval);
-        interp_acc_ += out_hz * iv / 60.0;
-        int k = (int)interp_acc_;
-        interp_acc_ -= k;
-        if (k < 1) k = 1;
+        // Outputs are evenly spaced in time, so each one shows the game at its own position between the
+        // previous and the new game frame: step = game frames per output. (Spacing the blend amounts
+        // evenly per game frame - 1/2 then 1/3, 2/3 at 144 Hz - made motion speed up and slow down.)
+        // One output per display slot: the slots falling inside this game frame's window (0, 1]; the one
+        // at 1.0 (if any) is the new frame itself. Showing the new frame as an extra output on top made
+        // 3.4 outputs per game frame at 144 Hz, which throttled the game below 60.
+        const double step = 60.0 / ((double)out_hz * iv);
+        if (interp_phase_ <= 0 || interp_phase_ > 1.0 + 1e-6) interp_phase_ = step;
+        std::vector<float> ts;
+        for (; interp_phase_ <= 1.0 + 1e-6; interp_phase_ += step) ts.push_back((float)interp_phase_);
+        interp_phase_ -= 1.0;
+        if (ts.empty()) ts.push_back(1.0f);
         bool can = recording_ && !rec_prev_.empty() && !rec_frame_.empty() && tc_.destroy_count == rec_destroy_count_ &&
                    g_s.pin_serial != 0 && !g_s.replay_unsafe && !prev_unsafe_ && final_img && shadows_.count(final_img) == 0 + shadows_.count(final_img);
         {
@@ -3743,11 +3821,11 @@ void VkRenderer::present(const FramebufferInfo& fb) {
             }
         }
         interp_lock.unlock();  // the replays render into shadow targets: the renderer thread may continue
-        for (int j = 1; j < k; j++) {
+        for (float t : ts) {
             VkImage out = image;
-            if (can) {
+            if (can && t < 0.999f) {
                 std::lock_guard<std::recursive_mutex> l(m_);  // the recorder itself is shared
-                replay_frame((float)j / k);
+                replay_frame(t);
                 out = shadow_of(final_img)->image;
                 static const char* strip_dir2 = getenv("HWDER_FILMSTRIP");
                 if (strip_dir2) filmstrip_capture(out, w, h, strip_dir2);
@@ -3755,7 +3833,6 @@ void VkRenderer::present(const FramebufferInfo& fb) {
             }
             display::present_image(out, w, h, 1, g_s.timeline, g_rec.serial() - 1);
         }
-        display::present_image(image, w, h, 1, g_s.timeline, g_rec.serial() - 1);
         recording_ = true;
     } else {
         interp_lock.unlock();

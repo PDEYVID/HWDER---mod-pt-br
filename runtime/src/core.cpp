@@ -5,6 +5,7 @@
 #include <psapi.h>
 #include <windows.h>
 #include <dbghelp.h>
+#include <tlhelp32.h>
 #include <timeapi.h>
 
 #include <algorithm>
@@ -13,6 +14,8 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <thread>
 
 #include "hwder/dispatch.h"
 #include "hwder/module.h"
@@ -164,10 +167,56 @@ extern "C" void hw_sleep_ns(s64 ns) {
     }
     static thread_local HANDLE timer =
         CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    LARGE_INTEGER due;
-    due.QuadPart = -(ns / 100);
-    if (timer && SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
-    else Sleep((DWORD)((ns + 999999) / 1000000));
+    static const bool trace = getenv("HWDER_SLEEP_TRACE") != nullptr;
+    static const s64 qpf = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    if (ns > 5000000000ll) {  // long sleeps: precision is irrelevant (and ns * qpf would overflow)
+        Sleep((DWORD)std::min<s64>(ns / 1000000, 0x7FFFFFFF));
+        return;
+    }
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
+    const s64 deadline = t0.QuadPart + ns * qpf / 1000000000;
+    // The console wakes a sleeping thread within microseconds; a Windows timer can't wait less than
+    // ~0.5 ms and often wakes later. The game polls with 1 us sleeps (each one cost ~0.7 ms here) and
+    // paces its frames with ~14 ms sleeps (woken 0.4-0.7 ms late on average): sleep on the timer only up
+    // to ~1 ms before the deadline, then yield-spin to it.
+    constexpr s64 kSpinNs = 1000000;
+    if (ns > kSpinNs + 500000 && timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -((ns - kSpinNs) / 100);
+        if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
+    }
+    for (LARGE_INTEGER now;;) {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= deadline) break;
+        SwitchToThread();
+    }
+    if (trace) {
+        // HWDER_SLEEP_TRACE=1: per thread, every 10 s: how many sleeps, requested vs. actual duration.
+        static thread_local u64 n = 0, req = 0, act = 0, worst = 0, last = GetTickCount64();
+        static thread_local u64 buckets[6] = {};  // requested <100us <500us <1ms <4ms <17ms >=17ms
+        LARGE_INTEGER t1, f;
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&f);
+        u64 us = (u64)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
+        n++;
+        req += (u64)ns / 1000;
+        act += us;
+        worst = std::max(worst, us - std::min(us, (u64)ns / 1000));
+        u64 r = (u64)ns / 1000;
+        buckets[r < 100 ? 0 : r < 500 ? 1 : r < 1000 ? 2 : r < 4000 ? 3 : r < 17000 ? 4 : 5]++;
+        if (GetTickCount64() - last > 10000) {
+            hw_log("sleep: thread %lu: %llu sleeps, avg requested %llu us, avg actual %llu us, worst overshoot %llu us | <100us %llu <500us %llu <1ms %llu <4ms %llu <17ms %llu >=17ms %llu",
+                   GetCurrentThreadId(), n, req / n, act / n, worst, buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]);
+            n = req = act = worst = 0;
+            memset(buckets, 0, sizeof(buckets));
+            last = GetTickCount64();
+        }
+    }
 }
 
 // ------------------------------------------------------------------ logging / crashes
@@ -370,6 +419,217 @@ static void start_thread_dumper() {
     }, nullptr, 0, nullptr);
 }
 
+// Return addresses of a (possibly running) thread's stack from a register snapshot. The stack can
+// change under us, so a bad read just ends the walk.
+static int unwind_pcs(CONTEXT* ctx, u64* out, int max) {
+    int n = 0;
+    __try {
+        while (n < max && ctx->Rip) {
+            out[n++] = ctx->Rip;
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx->Rip, &base, nullptr);
+            if (!fn) break;
+            void* hd = nullptr;
+            DWORD64 est = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx->Rip, fn, ctx, &hd, &est, nullptr);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
+
+// HWDER_CPU_TRACE=1: every second, system-wide CPU use vs. this process's (is something else eating
+// the CPU while the game stalls?).
+static void start_cpu_trace() {
+    if (!getenv("HWDER_CPU_TRACE")) return;
+    std::thread([] {
+        SetThreadDescription(GetCurrentThread(), L"HWDER cpu trace");
+        auto ft = [](const FILETIME& f) { return ((u64)f.dwHighDateTime << 32) | f.dwLowDateTime; };
+        FILETIME i0, k0, u0, c, e, pk0, pu0;
+        GetSystemTimes(&i0, &k0, &u0);
+        GetProcessTimes(GetCurrentProcess(), &c, &e, &pk0, &pu0);
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        for (;;) {
+            Sleep(1000);
+            FILETIME i1, k1, u1, pk1, pu1;
+            GetSystemTimes(&i1, &k1, &u1);
+            GetProcessTimes(GetCurrentProcess(), &c, &e, &pk1, &pu1);
+            double idle = (double)(ft(i1) - ft(i0)), total = (double)(ft(k1) - ft(k0) + ft(u1) - ft(u0));  // kernel includes idle
+            double proc = (double)(ft(pk1) - ft(pk0) + ft(pu1) - ft(pu0));
+            hw_log("cpu: system busy %.0f%%, this process %.0f%% (of %lu logical CPUs)", total > 0 ? 100.0 * (total - idle) / total : 0.0,
+                   total > 0 ? 100.0 * proc / total : 0.0, si.dwNumberOfProcessors);
+            i0 = i1, k0 = k1, u0 = u1, pk0 = pk1, pu0 = pu1;
+        }
+    }).detach();
+}
+
+// ------------------------------------------------------------------ sampling profiler
+// HWDER_SAMPLE=<thread name substring> ("GPU", "guest", ...): samples every matching host thread ~1000x/s
+// and logs per thread, every HWDER_SAMPLE_SECS (default 15) seconds, how busy it was and the functions
+// it spent its time in - "self" (the sampled instruction) and "incl" (anywhere in the first 12 frames).
+static void start_sampler() {
+    static const char* want = getenv("HWDER_SAMPLE");
+    if (!want || !*want) return;
+    std::thread([] {
+        SetThreadDescription(GetCurrentThread(), L"HWDER sampler");
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        const char* secs_env = getenv("HWDER_SAMPLE_SECS");
+        const u64 report_ms = (secs_env ? atoi(secs_env) : 15) * 1000ull;
+        struct Target {
+            HANDLE h;
+            std::string name;
+            std::unordered_map<u64, u32> self, incl;
+            u32 samples = 0;
+            u64 cycles0 = 0;
+            u64 scan_cycles = 0;  // cycle count at the last scan
+            bool active = true;   // used >5% of a core since the last scan: only these are sampled
+        };
+        std::vector<Target> targets;
+        std::vector<DWORD> known;
+        HANDLE proc = GetCurrentProcess();
+        u64 last = GetTickCount64(), last_scan = 0;
+        auto is_idle = [](const std::string& n) {
+            return n.find("WaitFor") != std::string::npos || n.find("SleepConditionVariable") != std::string::npos ||
+                   n.find("DelayExecution") != std::string::npos || n.find("RemoveIoCompletion") != std::string::npos;
+        };
+        auto report = [&] {
+            SymRefreshModuleList(proc);
+            char symbuf[sizeof(SYMBOL_INFO) + 256];
+            auto name_of = [&](u64 pc) {
+                auto* sym = (SYMBOL_INFO*)symbuf;
+                memset(symbuf, 0, sizeof(symbuf));
+                sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+                sym->MaxNameLen = 255;
+                DWORD64 disp = 0;
+                if (SymFromAddr(proc, pc, &disp, sym)) return std::string(sym->Name);
+                HMODULE mod = nullptr;
+                char mn[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &mod))
+                    GetModuleBaseNameA(proc, mod, mn, sizeof(mn));
+                return std::string(mn) + "!?";
+            };
+            auto fold = [&](std::unordered_map<u64, u32>& m) {
+                std::unordered_map<std::string, u32> by;
+                for (auto& [pc, n] : m) by[name_of(pc)] += n;
+                std::vector<std::pair<u32, std::string>> v;
+                for (auto& [k, n] : by) v.push_back({n, k});
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                return v;
+            };
+            for (Target& tg : targets) {
+                if (!tg.samples) continue;  // inactive the whole window
+                auto s = fold(tg.self);
+                u32 idle = 0;
+                for (auto& [n, k] : s)
+                    if (is_idle(k)) idle += n;
+                // CPU time the thread actually consumed over the window, independent of sampling.
+                ULONG64 cyc = 0;
+                QueryThreadCycleTime(tg.h, &cyc);
+                hw_log("---- sampler: thread '%s': %u samples, %.0f%% busy, %.1f Gcycles ----", tg.name.c_str(), tg.samples,
+                       100.0 * (tg.samples - idle) / tg.samples, (cyc - tg.cycles0) / 1e9);
+                tg.cycles0 = cyc;
+                if (tg.samples - idle >= tg.samples / 20) {  // mostly idle threads get no breakdown
+                    for (size_t i = 0; i < s.size() && i < 20; i++)
+                        hw_log("  self %5.1f%%  %s", 100.0 * s[i].first / tg.samples, s[i].second.c_str());
+                    auto in = fold(tg.incl);
+                    for (size_t i = 0, shown = 0; i < in.size() && shown < 25; i++) {
+                        const std::string& k = in[i].second;
+                        if (k.find("thread_start") != std::string::npos || k.find("BaseThreadInitThunk") != std::string::npos ||
+                            k.find("RtlUserThreadStart") != std::string::npos || k.find("_Invoke") != std::string::npos)
+                            continue;
+                        hw_log("  incl %5.1f%%  %s", 100.0 * in[i].first / tg.samples, k.c_str());
+                        shown++;
+                    }
+                }
+                tg.self.clear();
+                tg.incl.clear();
+                tg.samples = 0;
+            }
+        };
+        for (;;) {
+            Sleep(1);
+            u64 now = GetTickCount64();
+            if (now - last_scan > 2000) {  // pick up new matching threads, re-rate the known ones
+                // Suspending every matching thread each millisecond slows the game itself: only threads
+                // that actually ran (>5% of a core over the last scan interval) are sampled.
+                for (Target& tg : targets) {
+                    ULONG64 cyc = 0;
+                    QueryThreadCycleTime(tg.h, &cyc);
+                    tg.active = (double)(cyc - tg.scan_cycles) > 0.05 * 3e9 * (now - last_scan) / 1000.0;
+                    tg.scan_cycles = cyc;
+                }
+                last_scan = now;
+                HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                THREADENTRY32 te{sizeof(te)};
+                for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+                    if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+                    if (std::find(known.begin(), known.end(), te.th32ThreadID) != known.end()) continue;
+                    HANDLE h = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                    if (!h) continue;
+                    PWSTR d = nullptr;
+                    std::string n;
+                    if (SUCCEEDED(GetThreadDescription(h, &d)) && d) {
+                        char b[256];
+                        WideCharToMultiByte(CP_UTF8, 0, d, -1, b, sizeof(b), nullptr, nullptr);
+                        n = b;
+                        LocalFree(d);
+                    }
+                    if (n.empty()) {
+                        // Unnamed (service and loader threads): sampled under their id once they are
+                        // old enough that a guest thread would have named itself by now.
+                        static std::unordered_map<DWORD, int> seen;
+                        if (++seen[te.th32ThreadID] < 2) {
+                            CloseHandle(h);
+                            continue;
+                        }
+                        n = "tid " + std::to_string(te.th32ThreadID);
+                    }
+                    known.push_back(te.th32ThreadID);
+                    if ((strcmp(want, "*") != 0 && n.find(want) == std::string::npos) || n.find("sampler") != std::string::npos) {
+                        CloseHandle(h);
+                        continue;
+                    }
+                    Target tg;
+                    tg.h = h;
+                    tg.name = n;
+                    ULONG64 cyc = 0;
+                    QueryThreadCycleTime(h, &cyc);
+                    tg.cycles0 = tg.scan_cycles = cyc;
+                    targets.push_back(std::move(tg));
+                    hw_log("sampler: sampling thread '%s'", n.c_str());
+                }
+                CloseHandle(snap);
+            }
+            for (Target& tg : targets) {
+                if (!tg.active) continue;
+                // Only the register snapshot happens while the thread is suspended: it may hold the heap or
+                // loader lock, which anything else here (map inserts, unwind-table lookups) would need.
+                if (SuspendThread(tg.h) == (DWORD)-1) continue;
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_FULL;
+                bool got = GetThreadContext(tg.h, &ctx);
+                ResumeThread(tg.h);
+                if (!got) continue;
+                // The stack is unwound after resuming: a racy read of a live stack only costs accuracy.
+                tg.samples++;
+                tg.self[ctx.Rip]++;
+                u64 pcs[12];
+                int n = unwind_pcs(&ctx, pcs, 12);
+                for (int i = 0; i < n; i++) {
+                    bool dup = false;
+                    for (int k = 0; k < i; k++) dup |= pcs[k] == pcs[i];
+                    if (!dup) tg.incl[pcs[i]]++;
+                }
+            }
+            if (now - last >= report_ms) {
+                report();
+                last = now;
+            }
+        }
+    }).detach();
+}
+
 // ------------------------------------------------------------------ NSO loading
 static bool lz4_decompress(const u8* src, size_t src_size, u8* dst, size_t dst_size) {
     const u8* ip = src;
@@ -566,6 +826,8 @@ int main(int argc, char** argv) {
            (unsigned long long)stack_base, (unsigned long long)stack_size);
     kern::start_thread(t.get());
     start_thread_dumper();
+    start_sampler();
+    start_cpu_trace();
     WaitForSingleObject(t->host_handle, INFINITE);
     hw_log("main thread exited");
     return 0;

@@ -353,6 +353,24 @@ static void report_semaphore(Engine3D& e, u32 query) {
         default: value = 0; break;
         }
         if (counter == 0) value = payload;
+        if (counter != 0) {
+            // The counters are constants here (no real queries): the value does not depend on the GPU
+            // work before it, so write it now. Flushing and waiting for the GPU to go idle per report
+            // made bursts of occlusion queries (lightning, lens flares) stall the game for seconds while
+            // it polled for each result, and cost a queue submit per query.
+            if (short_form) {
+                u32 v = (u32)value;
+                ch->mm->write(addr, &v, 4);
+            } else {
+                struct {
+                    u64 value;
+                    u64 timestamp;
+                } r{value, gpu_time_ns()};
+                ch->mm->write(addr, &r, 16);
+            }
+            renderer()->invalidate_region((u64)ch->mm->translate(addr), short_form ? 4 : 16);
+            break;
+        }
         renderer()->flush_commands();
         renderer()->on_gpu_idle([ch, addr, value, short_form] {
             if (short_form) {
@@ -403,9 +421,14 @@ static void flush_macro(Engine3D& e) {
     u32 index = (u32)e.macro_index;
     e.macro_index = -1;
     e.mme.ctx_read_ = macro_read;
+    // The macro may start another macro (macro_params in use again) while it runs: take the
+    // parameters out, then hand the buffer back so its capacity is reused (re-growing a fresh vector
+    // cost several heap allocations per macro call - thousands per frame).
     std::vector<u32> params;
     params.swap(e.macro_params);
     e.mme.run(index, params, &e, macro_send);
+    params.clear();
+    if (e.macro_params.empty()) e.macro_params.swap(params);
 }
 
 static void method_3d(Engine3D& e, u32 method, u32 value) {

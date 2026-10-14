@@ -68,7 +68,48 @@ static void log_unimplemented(u32 imm, Ctx* c) {
            (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
 }
 
+// HWDER_SVC_ACCT=1: per guest thread, every second, the time spent inside each SVC (sleeps, waits,
+// IPC...) - where a stalled game thread is waiting.
+static void svc_dispatch_impl(Ctx* c, u32 imm);
+extern thread_local u32 t_current_svc;
 void svc_dispatch(Ctx* c, u32 imm) {
+    static const bool acct = getenv("HWDER_SVC_ACCT") != nullptr;
+    t_current_svc = imm;
+    if (!acct) {
+        svc_dispatch_impl(c, imm);
+        t_current_svc = 0xFFFF;
+        return;
+    }
+    static const double tick_ms = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1000.0 / f.QuadPart;
+    }();
+    struct Acct {
+        double ms[0x80] = {};
+        u32 n[0x80] = {};
+        LARGE_INTEGER start{};
+    };
+    static thread_local Acct a;
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    if (!a.start.QuadPart) a.start = t0;
+    svc_dispatch_impl(c, imm);
+    QueryPerformanceCounter(&t1);
+    a.ms[imm & 0x7F] += (t1.QuadPart - t0.QuadPart) * tick_ms;
+    a.n[imm & 0x7F]++;
+    double window = (t1.QuadPart - a.start.QuadPart) * tick_ms;
+    if (window >= 1000.0) {
+        char line[1024];
+        int o = snprintf(line, sizeof(line), "svc: thread %llu over %.0f ms:", current_thread() ? (unsigned long long)current_thread()->id : 0ull, window);
+        for (int i = 0; i < 0x80; i++)
+            if (a.ms[i] >= 5.0) o += snprintf(line + o, sizeof(line) - o, " %02x=%.0fms/%u", i, a.ms[i], a.n[i]);
+        hw_log("%s", line);
+        a = Acct{};
+    }
+}
+
+static void svc_dispatch_impl(Ctx* c, u32 imm) {
     Result r = ResultSuccess;
     switch (imm) {
     case 0x01: {  // SetHeapSize(size) -> addr

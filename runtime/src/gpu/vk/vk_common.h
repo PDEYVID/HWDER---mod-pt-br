@@ -3,6 +3,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <intrin.h>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -116,15 +117,45 @@ static const char* const kProfNames[kProfCount] = {
 extern double g_prof[kProfCount];
 extern float g_res_scale, g_res_scale_y;  // internal resolution scale (x, y) for large render targets
 extern u32 g_prof_draws;
+// Milliseconds per TSC tick (invariant TSC), calibrated once against QPC.
+inline double tsc_ms_per_tick() {
+    static const double v = [] {
+        LARGE_INTEGER f, q0, q1;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&q0);
+        u64 t0 = __rdtsc();
+        do QueryPerformanceCounter(&q1);
+        while ((q1.QuadPart - q0.QuadPart) * 1000 < f.QuadPart * 5);  // 5 ms
+        u64 t1 = __rdtsc();
+        return (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / f.QuadPart / (double)(t1 - t0);
+    }();
+    return v;
+}
+// Several of these run per draw (some created with new, one per phase): they use the TSC rather than
+// QueryPerformanceCounter and recycle their memory per thread instead of going through the heap.
 struct ProfScope {
     ProfPhase ph;
-    LARGE_INTEGER a;
-    explicit ProfScope(ProfPhase p) : ph(p) { QueryPerformanceCounter(&a); }
-    ~ProfScope() {
-        LARGE_INTEGER b, f;
-        QueryPerformanceCounter(&b);
-        QueryPerformanceFrequency(&f);
-        g_prof[ph] += (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+    u64 a;
+    explicit ProfScope(ProfPhase p) : ph(p), a(__rdtsc()) {}
+    ~ProfScope() { g_prof[ph] += (double)(__rdtsc() - a) * tsc_ms_per_tick(); }
+    static void* operator new(size_t n) {
+        void*& head = free_list();
+        if (void* p = head) {
+            head = *(void**)p;
+            return p;
+        }
+        return ::operator new(n < sizeof(void*) ? sizeof(void*) : n);
+    }
+    static void operator delete(void* p) {
+        void*& head = free_list();
+        *(void**)p = head;
+        head = p;
+    }
+
+private:
+    static void*& free_list() {
+        static thread_local void* head = nullptr;
+        return head;
     }
 };
 
@@ -132,13 +163,10 @@ struct ProfScope {
 struct SlowTimer {
     const char* what;
     double limit_ms;
-    LARGE_INTEGER a;
-    SlowTimer(const char* w, double limit) : what(w), limit_ms(limit) { QueryPerformanceCounter(&a); }
+    u64 a;
+    SlowTimer(const char* w, double limit) : what(w), limit_ms(limit), a(__rdtsc()) {}
     ~SlowTimer() {
-        LARGE_INTEGER b, f;
-        QueryPerformanceCounter(&b);
-        QueryPerformanceFrequency(&f);
-        double ms = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+        double ms = (double)(__rdtsc() - a) * tsc_ms_per_tick();
         if (ms > limit_ms) hw_log("vk: slow: %s took %.0f ms", what, ms);
     }
 };

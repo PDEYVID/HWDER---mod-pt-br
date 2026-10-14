@@ -159,17 +159,30 @@ static void build_ui(VkExtent2D extent) {
 
     ImGui::SeparatorText("Display");
     {
-        ImGui::BeginDisabled(true);
-        int dummy = 0;
-        const char* interp_items[] = {"Off (experimental, disabled)"};
-        ImGui::Combo("Frame interpolation", &dummy, interp_items, 1);
-        ImGui::EndDisabled();
+        // interp_hz: 0 off, -1 match the display, else a fixed output rate.
+        const int values[] = {0, -1, 120, 144};
+        const char* items[] = {"Off (60 fps)", "Match display refresh", "120 Hz", "144 Hz"};
+        int cur = 0;
+        for (int i = 0; i < 4; i++)
+            if (values[i] == v.interp_hz) cur = i;
+        if (ImGui::Combo("Frame interpolation", &cur, items, 4)) {
+            v.interp_hz = values[cur];
+            changed = true;
+            // Interpolation needs the panel's full refresh rate: drop the 60 Hz monitor switch.
+            if (v.interp_hz != 0 && v.display_60hz) {
+                v.display_60hz = false;
+                PostMessageW(g_hwnd, kMsgDisplay60, 0, 0);
+            }
+        }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Draw-level frame interpolation exists but is stubbed out: too janky in menus and gameplay. "
-                              "The game stays at its native 60 fps.");
+            ImGui::SetTooltip("The game runs at 60 fps. With interpolation each frame is re-rendered in between with blended\n"
+                              "3D positions (camera, characters), so motion is smooth on 120/144 Hz panels. The HUD and 2D\n"
+                              "elements show the newest frame. Costs extra GPU/CPU work per output frame, and adds one\n"
+                              "frame of latency. Turn it off if your PC can't hold the rate.");
     }
+    ImGui::BeginDisabled(v.interp_hz != 0);
     if (ImGui::Checkbox("Switch monitor to 60 Hz while playing", &v.display_60hz)) {
         changed = true;
         PostMessageW(g_hwnd, kMsgDisplay60, 0, v.display_60hz ? 1 : 0);
@@ -179,10 +192,10 @@ static void build_ui(VkExtent2D extent) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("The game renders at 60 fps and its movies at 30 fps. On a 144 Hz panel each frame is shown for\n"
                           "2 or 3 (movies: 4 or 5) refreshes in turn, which looks like stutter. At 60 Hz every frame is\n"
-                          "shown exactly once (movies: twice). Reverts when the game exits.");
-    ImGui::TextWrapped("Game logic runs at a fixed 60 fps: the game advances one step per frame, so releasing frames faster "
-                       "speeds the whole game up. Presentation pacing is locked to 60 Hz; true 120/144 fps needs a "
-                       "game-side timestep change (on the roadmap).");
+                          "shown exactly once (movies: twice). Reverts when the game exits. Not with frame interpolation.");
+    ImGui::EndDisabled();
+    ImGui::TextWrapped("Game logic runs at a fixed 60 fps (the game advances one step per frame). Higher refresh rates "
+                       "come from frame interpolation above.");
     if (ImGui::Checkbox("VSync (FIFO)", &v.vsync)) {
         changed = true;
         g_swapchain_dirty = true;
