@@ -21,6 +21,7 @@
 #include "hwder/dispatch.h"
 #include "hwder/module.h"
 #include "hwder/runtime.h"
+#include "launcher.h"
 #include "kernel/kernel.h"
 #include "service/ipc.h"
 #include "gpu/display.h"
@@ -820,6 +821,7 @@ int main(int argc, char** argv) {
     timeBeginPeriod(1);
     hw_log("HWDER - Hyrule Warriors: Definitive Edition static recompilation");
     hw_config_load(dir);
+    if (!launcher::run(dir)) return 0;  // the user closed the launcher
 
     std::string exefs = env_u8("HWDER_EXEFS");
     if (exefs.empty()) exefs = dir + "\\exefs";

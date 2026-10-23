@@ -80,6 +80,8 @@ void default_pad(Input& in, bool xbox_labels) {
     in.pad[kActDRight] = kPadDRight;
 }
 
+static Game g_game;
+Game& game() { return g_game; }
 Video& video() { return g_video; }
 Input& input() { return g_input; }
 
@@ -101,14 +103,19 @@ void load() {
     }
     FILE* f = fopen(kFile, "r");
     if (!f) return;
-    char line[256];
+    char line[2048];
     while (fgets(line, sizeof(line), f)) {
         char* eq = strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
         std::string k = line;
         const char* v = eq + 1;
-        if (k == "refresh") g_video.refresh = atoi(v);
+        std::string sv = v;  // string values: without the line break
+        while (!sv.empty() && (sv.back() == '\n' || sv.back() == '\r')) sv.pop_back();
+        if (k == "nsp") g_game.nsp = sv;
+        else if (k == "keys") g_game.keys = sv;
+        else if (k == "show_launcher") g_game.show_launcher = atoi(v) != 0;
+        else if (k == "refresh") g_video.refresh = atoi(v);
         else if (k == "vsync") g_video.vsync = atoi(v) != 0;
         else if (k == "aniso") g_video.aniso = atoi(v);
         else if (k == "window_w") g_video.window_w = atoi(v);
@@ -151,6 +158,7 @@ void save() {
             g_video.refresh, (int)g_video.vsync, g_video.aniso, g_video.window_w, g_video.window_h, (int)g_video.borderless,
             g_video.res_scale, (int)g_video.unlocked_res, (int)g_video.show_fps, (int)g_video.display_60hz, g_video.interp_hz);
     const Input& in = g_input;
+    fprintf(f, "nsp=%s\nkeys=%s\nshow_launcher=%d\n", g_game.nsp.c_str(), g_game.keys.c_str(), (int)g_game.show_launcher);
     fprintf(f, "language=%d\nturbo_speed=%d\nfxaa=%d\nsharpen=%d\n", g_video.language, g_video.turbo_speed, (int)g_video.fxaa,
             g_video.sharpen);
     fprintf(f, "pad_index=%d\ndeadzone_l=%d\ndeadzone_r=%d\ntrigger=%d\ninvert_rx=%d\ninvert_ry=%d\nrumble=%d\n", in.pad_index,

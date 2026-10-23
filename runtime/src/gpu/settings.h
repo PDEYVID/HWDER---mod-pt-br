@@ -1,7 +1,16 @@
 // User-facing video settings (edited in the F1 overlay, persisted in hwder_settings.ini next to the exe).
 #pragma once
+#include <string>
 
 namespace settings {
+
+// Startup launcher (launcher.cpp). Empty paths = auto-detect (NSP and keys beside the exe, etc.).
+struct Game {
+    std::string nsp;   // UTF-8
+    std::string keys;  // UTF-8
+    bool show_launcher = true;
+};
+Game& game();
 
 struct Video {
     int refresh = 60;           // presenter rate in Hz: 60, 120, 144; 0 = match the display

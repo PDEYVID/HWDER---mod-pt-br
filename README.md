@@ -19,7 +19,9 @@ of your own `.nsp` with your own `prod.keys` at run time. Nothing is extracted t
 2. Put your own dump of the game (`*.nsp`, title `0100AE00096EA000`, base game) and your
    console's `prod.keys` next to `hwder.exe`. Keys are also picked up from
    `%USERPROFILE%\.switch\prod.keys` and the yuzu / Ryujinx key folders.
-3. Run `hwder.exe`.
+3. Run `hwder.exe`. A launcher window comes first: it can point at an NSP / `prod.keys` elsewhere,
+   switches mods and translations on or off, and sets fullscreen / FPS counter. Untick "Show this
+   window at startup" to go straight into the game (hold **Shift** while starting to get it back).
 
 Requirements: Windows 10/11 x64, a Vulkan 1.3 driver (NVIDIA, AMD, Intel), an AVX2 CPU, and
 Media Foundation (built into Windows; "N" editions need the Media Feature Pack) for the movies.

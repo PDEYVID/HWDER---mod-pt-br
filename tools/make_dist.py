@@ -30,7 +30,9 @@ Setup
      <anything>.nsp     your dump of Hyrule Warriors: Definitive Edition (0100AE00096EA000, base game)
      prod.keys          your console's keys (also found in %USERPROFILE%\\.switch, or yuzu/Ryujinx key folders)
 2. Run hwder.exe. Code and assets are read straight out of the NSP while you play; nothing
-   is extracted to disk.
+   is extracted to disk. The launcher window that opens first can also point at an NSP or
+   prod.keys stored elsewhere and switch mods on/off (hold Shift while starting to show it
+   again after turning it off).
 
    Alternatively an already extracted dump works too: exefs\\ and romfs\\ folders next to the
    exe, or HWDER_EXEFS / HWDER_ROMFS environment variables pointing at them.
