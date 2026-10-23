@@ -3,6 +3,7 @@
 #include "gpu/vk_loader.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace overlay {
@@ -21,5 +22,6 @@ void on_swapchain(const std::vector<VkImage>& images, VkFormat fmt);  // called 
 // Records the overlay into `image` (must be in COLOR_ATTACHMENT_OPTIMAL layout). Cheap when hidden.
 void render(VkCommandBuffer cb, VkImage image, VkExtent2D extent);
 bool swapchain_dirty();  // vsync setting changed: recreate the swapchain
+void notify(const std::string& text);  // short message in the corner for a few seconds (any thread)
 
 }  // namespace overlay

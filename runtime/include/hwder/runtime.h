@@ -12,6 +12,9 @@ extern "C" {
 void hw_log(const char* fmt, ...);
 void hw_fatal(const char* why);
 void hw_sleep_ns(s64 ns);
+// Guest time scale (F2 turbo): >1 makes the guest clock run faster and guest sleeps/timeouts shorter.
+void hw_set_time_scale(double scale);
+s64 hw_scaled_ns(s64 guest_ns);  // a guest duration in host nanoseconds
 
 #ifdef __cplusplus
 }

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -119,6 +120,7 @@ void load() {
         else if (k == "display_60hz") g_video.display_60hz = atoi(v) != 0;
         else if (k == "interp_hz") g_video.interp_hz = atoi(v);
         else if (k == "language") g_video.language = atoi(v);
+        else if (k == "turbo_speed") g_video.turbo_speed = std::clamp(atoi(v), 2, 4);
         else if (k == "pad_index") g_input.pad_index = atoi(v);
         else if (k == "deadzone_l") g_input.deadzone_l = atoi(v);
         else if (k == "deadzone_r") g_input.deadzone_r = atoi(v);
@@ -147,7 +149,7 @@ void save() {
             g_video.refresh, (int)g_video.vsync, g_video.aniso, g_video.window_w, g_video.window_h, (int)g_video.borderless,
             g_video.res_scale, (int)g_video.unlocked_res, (int)g_video.show_fps, (int)g_video.display_60hz, g_video.interp_hz);
     const Input& in = g_input;
-    fprintf(f, "language=%d\n", g_video.language);
+    fprintf(f, "language=%d\nturbo_speed=%d\n", g_video.language, g_video.turbo_speed);
     fprintf(f, "pad_index=%d\ndeadzone_l=%d\ndeadzone_r=%d\ntrigger=%d\ninvert_rx=%d\ninvert_ry=%d\nrumble=%d\n", in.pad_index,
             in.deadzone_l, in.deadzone_r, in.trigger, (int)in.invert_rx, (int)in.invert_ry, in.rumble);
     for (int a = 0; a < kActCount; a++) {

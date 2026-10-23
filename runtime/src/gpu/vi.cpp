@@ -436,8 +436,8 @@ std::shared_ptr<ReadableEvent> vsync_event() {
             LARGE_INTEGER freq, next, now;
             QueryPerformanceFrequency(&freq);
             QueryPerformanceCounter(&next);
-            const s64 period = (s64)(freq.QuadPart / display::game_hz());
             for (;;) {
+                const s64 period = (s64)(freq.QuadPart / (display::game_hz() * display::speed()));  // F2 turbo
                 next.QuadPart += period;
                 QueryPerformanceCounter(&now);
                 s64 wait = next.QuadPart - now.QuadPart;

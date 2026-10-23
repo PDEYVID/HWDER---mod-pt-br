@@ -1,5 +1,6 @@
 #include "gpu/overlay.h"
 
+#include "gpu/display.h"
 #include "gpu/settings.h"
 #include "hid/host_input.h"
 #include "hwder/runtime.h"
@@ -8,6 +9,7 @@
 #include "imgui_impl_vulkan.h"
 #include "imgui_impl_win32.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -73,7 +75,7 @@ static const char* tr(const char* en) {
         {"Invert camera X", "Inverter câmera X"},
         {"Invert camera Y", "Inverter câmera Y"},
         {"Bindings", "Comandos"},
-        {"Esc cancels a capture. F1 and F11 are reserved.", "Esc cancela a captura. F1 e F11 são reservadas."},
+        {"Esc cancels a capture. F1, F2, F11 and F12 are reserved.", "Esc cancela a captura. F1, F2, F11 e F12 são reservadas."},
         {"Keyboard", "Teclado"},
         {"Keyboard (alt)", "Teclado (alt.)"},
         {"left stick", "analógico esquerdo"},
@@ -126,6 +128,12 @@ static const char* tr(const char* en) {
         {"no reference save at save_reference/zmha.bin", "nenhum save de referência em save_reference/zmha.bin"},
         {"could not read the save", "não foi possível ler o save"},
         {"Settings are saved to hwder_settings.ini when changed.", "As configurações são salvas no hwder_settings.ini ao mudar."},
+        {"Turbo %dx  (F2)", "Turbo %dx  (F2)"},
+        {"Turbo speed (F2)", "Velocidade do turbo (F2)"},
+        {"F2 speeds the whole game up (menus, cutscenes, grinding). Sound may crackle while it is on.",
+         "F2 acelera o jogo inteiro (menus, cenas, farm). O som pode falhar enquanto estiver ligado."},
+        {"Screenshot: %s", "Captura: %s"},
+        {"F12 saves a screenshot to the screenshots folder.", "F12 salva uma captura de tela na pasta screenshots."},
         {"Language", "Idioma"},
         {"Automatic", "Automático"},
         {"Left stick up", "Analógico esquerdo cima"},
@@ -211,7 +219,7 @@ bool wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (vk == VK_SHIFT) vk = (int)MapVirtualKeyW((lp >> 16) & 0xFF, MAPVK_VSC_TO_VK_EX);
         else if (vk == VK_CONTROL) vk = (lp & (1 << 24)) ? VK_RCONTROL : VK_LCONTROL;
         else if (vk == VK_MENU) vk = (lp & (1 << 24)) ? VK_RMENU : VK_LMENU;
-        if (vk != VK_F1 && vk != VK_F11) {
+        if (vk != VK_F1 && vk != VK_F2 && vk != VK_F11 && vk != VK_F12) {
             if (vk != VK_ESCAPE) {
                 settings::input().keys[g_capture_action][g_capture_slot] = vk;
                 settings::save();
@@ -227,7 +235,7 @@ bool wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: case WM_LBUTTONDBLCLK: case WM_CHAR: case WM_KEYUP:
         return true;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
-        return wp != VK_F1 && wp != VK_F11;
+        return wp != VK_F1 && wp != VK_F2 && wp != VK_F11 && wp != VK_F12;
     }
     return false;
 }
@@ -238,6 +246,20 @@ void toggle() {
     g_capture_action = -1;
 }
 bool visible() { return g_visible; }
+
+static std::string g_note;
+static double g_note_until = 0;
+static double now_seconds() {
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart / f.QuadPart;
+}
+void notify(const std::string& text) {
+    std::lock_guard<std::recursive_mutex> l(g_m);
+    g_note = text;
+    g_note_until = now_seconds() + 3.0;
+}
 bool swapchain_dirty() {
     bool d = g_swapchain_dirty;
     g_swapchain_dirty = false;
@@ -376,7 +398,7 @@ static bool controls_tab() {
     changed |= ImGui::Checkbox(tr("Invert camera Y"), &in.invert_ry);
 
     ImGui::SeparatorText(tr("Bindings"));
-    ImGui::TextDisabled(tr("Esc cancels a capture. F1 and F11 are reserved."));
+    ImGui::TextDisabled(tr("Esc cancels a capture. F1, F2, F11 and F12 are reserved."));
     if (ImGui::BeginTable("##binds", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY,
                           ImVec2(0, 230))) {
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -458,6 +480,24 @@ static void build_ui(VkExtent2D extent) {
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
         ImGui::Text(tr("Preparing shaders... %d left"), left);
+        ImGui::End();
+    }
+    if (display::turbo()) {
+        ImGui::SetNextWindowPos(ImVec2((float)extent.width - 8, 8), ImGuiCond_Always, ImVec2(1, 0));
+        ImGui::SetNextWindowBgAlpha(0.45f);
+        ImGui::Begin("##turbo", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1), tr("Turbo %dx  (F2)"), (int)display::speed());
+        ImGui::End();
+    }
+    if (now_seconds() < g_note_until) {
+        ImGui::SetNextWindowPos(ImVec2((float)extent.width - 8, (float)extent.height - 8), ImGuiCond_Always, ImVec2(1, 1));
+        ImGui::SetNextWindowBgAlpha(0.6f);
+        ImGui::Begin("##note", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+        ImGui::Text(tr("Screenshot: %s"), g_note.c_str());
         ImGui::End();
     }
     if (!g_visible) return;
@@ -606,6 +646,20 @@ static void build_ui(VkExtent2D extent) {
 
         ImGui::SeparatorText("Overlay");
         if (ImGui::Checkbox(tr("Show frame time"), &v.show_fps)) changed = true;
+        {
+            const char* speeds[] = {"2x", "3x", "4x"};
+            int cur = std::clamp(v.turbo_speed, 2, 4) - 2;
+            ImGui::SetNextItemWidth(120);
+            if (ImGui::Combo(tr("Turbo speed (F2)"), &cur, speeds, 3)) {
+                v.turbo_speed = cur + 2;
+                changed = true;
+                if (display::turbo()) display::set_turbo(true);  // apply the new speed now
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(?)");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("F2 speeds the whole game up (menus, cutscenes, grinding). Sound may crackle while it is on."));
+            ImGui::TextDisabled(tr("F12 saves a screenshot to the screenshots folder."));
+        }
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Cheats")) {
@@ -701,7 +755,8 @@ void render(VkCommandBuffer cb, VkImage image, VkExtent2D extent) {
     settings::Video& v = settings::video();
     if (!g_visible) g_capture_action = -1;
     hid::set_input_block(!g_visible ? 0 : g_capture_action >= 0 ? 2 : 1);
-    if (!g_visible && !v.show_fps && hw_shader_precompile_left.load() <= 0) return;
+    if (!g_visible && !v.show_fps && hw_shader_precompile_left.load() <= 0 && !display::turbo() && now_seconds() > g_note_until)
+        return;
     auto vit = g_views.find(image);
     if (vit == g_views.end()) return;
     ImGui_ImplVulkan_NewFrame();

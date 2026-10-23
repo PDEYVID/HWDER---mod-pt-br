@@ -249,6 +249,7 @@ static std::multimap<u64, CvWaiter*> g_cv_waiters;
 
 Result wait_process_wide_key(u64 mutex_addr, u64 key, Handle self, s64 timeout_ns) {
     KGuard g(g_kernel_lock);
+    timeout_ns = hw_scaled_ns(timeout_ns);  // F2 turbo: guest time runs faster
     release_mutex(mutex_addr);
     CvWaiter w{current_thread(), mutex_addr, self};
     auto it = g_cv_waiters.insert({key, &w});
@@ -321,6 +322,7 @@ static std::multimap<u64, AddrWaiter*> g_addr_waiters;
 
 Result wait_for_address(u64 addr, u32 type, s32 value, s64 timeout_ns) {
     KGuard g(g_kernel_lock);
+    timeout_ns = hw_scaled_ns(timeout_ns);  // F2 turbo: guest time runs faster
     s32 cur = __atomic_load_n((s32*)addr, __ATOMIC_SEQ_CST);
     switch (type) {
     case 0:  // WaitIfLessThan
@@ -411,6 +413,7 @@ void unmap_shared_memory(SharedMemory* s) {
 // ------------------------------------------------------------------ WaitSynchronization
 static Result wait_synchronization_impl(const Handle* handles, s32 count, s64 timeout_ns, s32* out_index) {
     KGuard g(g_kernel_lock);
+    timeout_ns = hw_scaled_ns(timeout_ns);  // F2 turbo: guest time runs faster
     std::vector<ObjectPtr> objs;
     for (s32 i = 0; i < count; i++) {
         ObjectPtr o = g_handles.get(handles[i]);

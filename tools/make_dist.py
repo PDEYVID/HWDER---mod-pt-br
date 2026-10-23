@@ -50,6 +50,8 @@ Controls
        unlocked/ultrawide resolution, vsync, borderless, anisotropic filtering, FPS counter)
        and the save-file Cheats tab.
 - F11  toggle borderless fullscreen.
+- F12  screenshot (PNG) into the screenshots folder.
+- F2   turbo on/off (2x/3x/4x, set in F1 -> Video).
 
 Files created next to the exe
 -----------------------------

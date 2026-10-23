@@ -4,6 +4,7 @@
 #include "display.h"
 
 #include <timeapi.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <chrono>
@@ -102,6 +103,8 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case overlay::kMsgDisplay60: set_display_60hz(h, lp != 0); return 0;
     case WM_KEYDOWN:
         if (wp == VK_F1) overlay::toggle();
+        if (wp == VK_F2 && !(lp & (1 << 30))) set_turbo(!turbo());  // not on auto-repeat
+        if (wp == VK_F12 && !(lp & (1 << 30))) request_screenshot();
         if (wp == VK_F11) {
             set_borderless(h, !settings::video().borderless);
             settings::save();
@@ -461,7 +464,7 @@ static void frame_limit(u32 interval) {
     // limiter to 30 fps (the title screen alternates 1/2 every second, which made that stutter).
     // The game is frame-locked (its logic advances per released frame), so the release grid stays at
     // 60 Hz whatever the display runs at; HWDER_FPS exists only for experiments.
-    double fps = env ? atof(env) : (g_output_hz > 0 ? g_output_hz : game_hz());
+    double fps = env ? atof(env) : (g_output_hz > 0 ? g_output_hz : game_hz() * speed());
     static u32 last_interval = 0;
     if (interval != last_interval) {
         last_interval = interval;
@@ -508,6 +511,151 @@ static void frame_limit(u32 interval) {
     }
     do QueryPerformanceCounter(&now);
     while (now.QuadPart < next.QuadPart);
+}
+
+// ------------------------------------------------------------------ turbo (F2)
+static std::atomic<bool> g_turbo{false};
+void set_turbo(bool on) {
+    g_turbo = on;
+    hw_set_time_scale(speed());  // the game paces itself on its own clock: speed that up too
+    hw_log("display: turbo %s (%.0fx)", on ? "on" : "off", speed());
+}
+bool turbo() { return g_turbo; }
+double speed() { return g_turbo ? (double)std::clamp(settings::video().turbo_speed, 2, 4) : 1.0; }
+
+// ------------------------------------------------------------------ screenshots (F12)
+// The game image (no overlay) is blitted into a B8G8R8A8 image, copied to a host buffer by the present
+// command buffer, and encoded as PNG by WIC on a worker thread.
+static std::atomic<bool> g_shot_request{false};
+struct Shot {
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory img_mem = VK_NULL_HANDLE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory buf_mem = VK_NULL_HANDLE;
+    void* map = nullptr;
+    u32 w = 0, h = 0;
+};
+static Shot g_shot;
+
+void request_screenshot() { g_shot_request = true; }
+
+static u32 mem_type(u32 bits, VkMemoryPropertyFlags want) {
+    for (u32 i = 0; i < g_dev.mem.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (g_dev.mem.memoryTypes[i].propertyFlags & want) == want) return i;
+    return ~0u;
+}
+
+// Staging image + buffer for a w x h capture (kept between screenshots of the same size).
+static bool shot_resources(u32 w, u32 h) {
+    if (g_shot.img && g_shot.w == w && g_shot.h == h) return true;
+    if (g_shot.img) {  // the previous capture finished (its fence was waited on)
+        vkUnmapMemory(g_dev.dev, g_shot.buf_mem);
+        vkDestroyBuffer(g_dev.dev, g_shot.buf, nullptr);
+        vkFreeMemory(g_dev.dev, g_shot.buf_mem, nullptr);
+        vkDestroyImage(g_dev.dev, g_shot.img, nullptr);
+        vkFreeMemory(g_dev.dev, g_shot.img_mem, nullptr);
+        g_shot = {};
+    }
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ici.extent = {w, h, 1};
+    ici.mipLevels = ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateImage(g_dev.dev, &ici, nullptr, &g_shot.img) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(g_dev.dev, g_shot.img, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mai.memoryTypeIndex == ~0u || vkAllocateMemory(g_dev.dev, &mai, nullptr, &g_shot.img_mem) != VK_SUCCESS) return false;
+    vkBindImageMemory(g_dev.dev, g_shot.img, g_shot.img_mem, 0);
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = (VkDeviceSize)w * h * 4;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(g_dev.dev, &bci, nullptr, &g_shot.buf) != VK_SUCCESS) return false;
+    vkGetBufferMemoryRequirements(g_dev.dev, g_shot.buf, &mr);
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (mai.memoryTypeIndex == ~0u)
+        mai.memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mai.memoryTypeIndex == ~0u || vkAllocateMemory(g_dev.dev, &mai, nullptr, &g_shot.buf_mem) != VK_SUCCESS) return false;
+    vkBindBufferMemory(g_dev.dev, g_shot.buf, g_shot.buf_mem, 0);
+    if (vkMapMemory(g_dev.dev, g_shot.buf_mem, 0, VK_WHOLE_SIZE, 0, &g_shot.map) != VK_SUCCESS) return false;
+    g_shot.w = w;
+    g_shot.h = h;
+    return true;
+}
+
+static void shot_record(VkCommandBuffer cb, VkImage src, u32 w, u32 h) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = g_shot.img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkImageBlit blit{};
+    blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = blit.dstOffsets[1] = {(s32)w, (s32)h, 1};
+    vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_GENERAL, g_shot.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy c{};
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cb, g_shot.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_shot.buf, 1, &c);
+    VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = g_shot.buf;
+    bb.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+}
+
+static void shot_save(std::vector<u8> px, u32 w, u32 h) {
+    std::thread([px = std::move(px), w, h]() mutable {
+        for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;  // the game's alpha channel is not coverage
+        CreateDirectoryW(L"screenshots", nullptr);
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        wchar_t path[96];
+        swprintf(path, 96, L"screenshots\\HWDER_%04u-%02u-%02u_%02u-%02u-%02u.png", t.wYear, t.wMonth, t.wDay, t.wHour,
+                 t.wMinute, t.wSecond);
+        bool ok = false;
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        IWICImagingFactory* fac = nullptr;
+        IWICStream* st = nullptr;
+        IWICBitmapEncoder* enc = nullptr;
+        IWICBitmapFrameEncode* fr = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))) &&
+            SUCCEEDED(fac->CreateStream(&st)) && SUCCEEDED(st->InitializeFromFilename(path, GENERIC_WRITE)) &&
+            SUCCEEDED(fac->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+            SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) && SUCCEEDED(enc->CreateNewFrame(&fr, nullptr)) &&
+            SUCCEEDED(fr->Initialize(nullptr)) && SUCCEEDED(fr->SetSize(w, h))) {
+            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+            ok = SUCCEEDED(fr->SetPixelFormat(&fmt)) && IsEqualGUID(fmt, GUID_WICPixelFormat32bppBGRA) &&
+                 SUCCEEDED(fr->WritePixels(h, w * 4, (UINT)px.size(), px.data())) && SUCCEEDED(fr->Commit()) &&
+                 SUCCEEDED(enc->Commit());
+        }
+        if (fr) fr->Release();
+        if (enc) enc->Release();
+        if (st) st->Release();
+        if (fac) fac->Release();
+        if (SUCCEEDED(co)) CoUninitialize();
+        char u8[192];
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, u8, sizeof(u8), nullptr, nullptr);
+        hw_log("display: screenshot %s %s", u8, ok ? "saved" : "FAILED");
+        overlay::notify(ok ? std::string(u8) : std::string("screenshot failed"));
+    }).detach();
 }
 
 static void update_title(bool guest) {
@@ -610,6 +758,8 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
         vkCmdBlitImage(fs.cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        VK_FILTER_LINEAR);
     }
+    const bool shot = src && g_shot_request.exchange(false) && shot_resources(w, h);
+    if (shot) shot_record(fs.cb, src, w, h);
     // overlay (F1 menu / frame-time readout) on top of the game image
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -663,6 +813,11 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
                (pq3.QuadPart - pq0.QuadPart) * 1000.0 / tf.QuadPart, (pq1.QuadPart - pq0.QuadPart) * 1000.0 / tf.QuadPart,
                (pq2.QuadPart - pq1.QuadPart) * 1000.0 / tf.QuadPart, (pq3.QuadPart - pq2.QuadPart) * 1000.0 / tf.QuadPart);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g_resize = true;
+    if (shot) {  // a one-off wait of a few ms; the encoding runs on its own thread
+        vkWaitForFences(g_dev.dev, 1, &fs.fence, VK_TRUE, UINT64_MAX);
+        const u8* p = (const u8*)g_shot.map;
+        shot_save(std::vector<u8>(p, p + (size_t)w * h * 4), w, h);
+    }
 }
 
 void present_image(VkImage image, u32 width, u32 height, u32 swap_interval, VkSemaphore wait_sem, u64 wait_value) {

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -141,15 +142,46 @@ extern "C" void hw_dispatch(Ctx* c) {
 }
 
 // ------------------------------------------------------------------ misc runtime hooks
-extern "C" u64 hw_cntvct(void) {
-    static LARGE_INTEGER freq = [] {
+// Guest time scale (F2 turbo): the guest clock runs `scale` times faster than the host's and guest
+// sleeps/timeouts shrink by the same factor, so the game's own frame pacing speeds up. The clock is
+// re-anchored on every change so it stays continuous; the bases are immutable (old ones are leaked,
+// a handful per session) so readers need no lock.
+struct TimeBase {
+    s64 real0;
+    double virt0;
+    double scale;
+};
+static std::atomic<const TimeBase*> g_time_base{new TimeBase{0, 0.0, 1.0}};
+static double qpc_to_ticks() {
+    static const double k = [] {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
-        return f;
+        return 19200000.0 / (double)f.QuadPart;
     }();
+    return k;
+}
+
+extern "C" u64 hw_cntvct(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    return (u64)((double)t.QuadPart * (19200000.0 / (double)freq.QuadPart));
+    const TimeBase* b = g_time_base.load(std::memory_order_acquire);
+    return (u64)(b->virt0 + (double)(t.QuadPart - b->real0) * qpc_to_ticks() * b->scale);
+}
+
+void hw_set_time_scale(double scale) {
+    static std::mutex m;
+    std::lock_guard<std::mutex> l(m);
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    const TimeBase* b = g_time_base.load(std::memory_order_acquire);
+    double now = b->virt0 + (double)(t.QuadPart - b->real0) * qpc_to_ticks() * b->scale;
+    g_time_base.store(new TimeBase{t.QuadPart, now, scale}, std::memory_order_release);
+}
+
+s64 hw_scaled_ns(s64 guest_ns) {
+    double s = g_time_base.load(std::memory_order_acquire)->scale;
+    if (guest_ns <= 0 || s == 1.0) return guest_ns;
+    return std::max<s64>(1, (s64)(guest_ns / s));
 }
 extern "C" void hw_yield(void) { SwitchToThread(); }
 extern "C" void hw_brk(Ctx* c, u64 pc, u32 imm) {
@@ -165,6 +197,7 @@ extern "C" void hw_sleep_ns(s64 ns) {
         SwitchToThread();
         return;
     }
+    ns = hw_scaled_ns(ns);
     static thread_local HANDLE timer =
         CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     static const bool trace = getenv("HWDER_SLEEP_TRACE") != nullptr;

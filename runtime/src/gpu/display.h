@@ -41,4 +41,12 @@ double monitor_hz();
 // HWDER_PATCH_DT=<hz> (which also rewrites the game's time step) runs the game loop at that rate.
 double game_hz();
 
+// Turbo (F2): the game's vsync event and the presenter run `speed()` times faster.
+void set_turbo(bool on);
+bool turbo();
+double speed();  // 1 normally, settings turbo_speed while turbo is on
+
+// F12: save the next game frame (without the overlay) as screenshots\HWDER_<date>_<time>.png.
+void request_screenshot();
+
 }  // namespace display

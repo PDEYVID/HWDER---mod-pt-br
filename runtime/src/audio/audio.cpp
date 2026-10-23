@@ -15,6 +15,7 @@
 #include <mutex>
 #include <thread>
 
+#include "gpu/display.h"
 #include "service/common.h"
 
 #pragma comment(lib, "ole32.lib")
@@ -799,7 +800,12 @@ static void audio_thread() {
     std::vector<s16> frame, resampled;
     double out_frac = 0;
     s16 last[2] = {};
+    u64 tick = 0;
     for (;;) {
+        // F2 turbo: tick `speed` times faster (the game follows audio time) but send only every
+        // speed-th tick to the device, which still plays in real time.
+        const double speed = display::speed();
+        const bool to_device = speed <= 1.0 || tick++ % (u64)speed == 0;
         std::vector<std::shared_ptr<Renderer>> rs;
         {
             std::lock_guard<std::mutex> l(g_renderers_lock);
@@ -812,6 +818,7 @@ static void audio_thread() {
             if (!r->started()) continue;
             frame.resize((size_t)p.sample_count * 2);
             r->render(frame.data());
+            if (!to_device) continue;
             if (p.sample_rate == kTargetRate) {
                 g_ring.push(frame.data(), p.sample_count);
             } else {  // linear resample to 48 kHz
@@ -832,6 +839,7 @@ static void audio_thread() {
             }
         }
         for (auto& r : rs) r->event()->signal();
+        period_ticks = (s64)(period_ticks / speed);
         next.QuadPart += period_ticks;
         QueryPerformanceCounter(&now);
         s64 wait = next.QuadPart - now.QuadPart;

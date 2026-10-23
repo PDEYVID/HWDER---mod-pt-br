@@ -31,7 +31,9 @@ sets stick deadzones, trigger threshold, vibration strength and camera inversion
 input test. The **Video** tab has frame interpolation for 120/144 Hz displays, the internal
 resolution scale, unlocked resolution for
 ultrawide, vsync, borderless, anisotropic filtering, FPS counter and the 60 Hz monitor switch;
-**Cheats** edits the save file. **F11** toggles borderless fullscreen. Any XInput controller
+**Cheats** edits the save file. **F11** toggles borderless fullscreen, **F12** saves a screenshot
+(PNG, without the overlay) to `screenshots\`, and **F2** toggles turbo (2x/3x/4x, set in the Video
+tab; the whole game speeds up, sound gets choppy). Any XInput controller
 works; default keyboard: WASD move, arrows camera, K/Enter = A, J/Backspace = B, I = X, L = Y,
 Q/E = L/R, U/O = ZL/ZR, Space = +, Tab = -, 1-4 = D-pad, Z/C = stick clicks.
 

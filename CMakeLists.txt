@@ -56,7 +56,7 @@ add_custom_command(OUTPUT ${HW_SHADER_VERSION_H}
     COMMENT "Shader translator version")
 list(APPEND RUNTIME_SOURCES ${HW_SHADER_VERSION_H})
 add_executable(hwder ${RUNTIME_SOURCES})
-target_link_libraries(hwder PRIVATE hwder_game dbghelp winmm synchronization psapi bcrypt)
+target_link_libraries(hwder PRIVATE hwder_game dbghelp winmm synchronization psapi bcrypt windowscodecs ole32 uuid)
 target_include_directories(hwder PRIVATE runtime/src ${CMAKE_BINARY_DIR}/gen ${TP}/vulkan-headers/include ${TP}/spirv-headers/include ${TP}/imgui ${TP}/imgui/backends)
 target_compile_definitions(hwder PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN IMGUI_IMPL_VULKAN_NO_PROTOTYPES IMGUI_IMPL_VULKAN_USE_LOADER IMGUI_DISABLE_OBSOLETE_FUNCTIONS IMGUI_USER_CONFIG="gpu/hwder_imconfig.h")
 target_compile_options(hwder PRIVATE ${HW_ARCH_FLAGS} /Z7 /O2 /EHsc -Wno-everything)
