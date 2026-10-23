@@ -43,9 +43,21 @@ if(EXISTS ${HW_ICON})
     list(APPEND RUNTIME_SOURCES ${CMAKE_BINARY_DIR}/hwder_icon.rc)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HW_ICON})
 endif()
+# Shader translator version (hash of its sources) for the persistent shader cache.
+set(HW_SHADER_SRCS ${RUNTIME_SOURCES})
+list(FILTER HW_SHADER_SRCS INCLUDE REGEX "^runtime/src/shader/")
+list(APPEND HW_SHADER_SRCS runtime/src/shader/shader.h runtime/src/shader/internal.h runtime/src/shader/translator.h
+     runtime/src/shader/spv_builder.h runtime/src/shader/opcodes.inc runtime/src/shader/decode.h)
+list(TRANSFORM HW_SHADER_SRCS PREPEND ${CMAKE_SOURCE_DIR}/)
+set(HW_SHADER_VERSION_H ${CMAKE_BINARY_DIR}/gen/shader_version.h)
+add_custom_command(OUTPUT ${HW_SHADER_VERSION_H}
+    COMMAND ${CMAKE_COMMAND} "-DOUT=${HW_SHADER_VERSION_H}" "-DSRCS=${HW_SHADER_SRCS}" -P ${CMAKE_SOURCE_DIR}/cmake/shader_version.cmake
+    DEPENDS ${HW_SHADER_SRCS} ${CMAKE_SOURCE_DIR}/cmake/shader_version.cmake
+    COMMENT "Shader translator version")
+list(APPEND RUNTIME_SOURCES ${HW_SHADER_VERSION_H})
 add_executable(hwder ${RUNTIME_SOURCES})
 target_link_libraries(hwder PRIVATE hwder_game dbghelp winmm synchronization psapi bcrypt)
-target_include_directories(hwder PRIVATE runtime/src ${TP}/vulkan-headers/include ${TP}/spirv-headers/include ${TP}/imgui ${TP}/imgui/backends)
+target_include_directories(hwder PRIVATE runtime/src ${CMAKE_BINARY_DIR}/gen ${TP}/vulkan-headers/include ${TP}/spirv-headers/include ${TP}/imgui ${TP}/imgui/backends)
 target_compile_definitions(hwder PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN IMGUI_IMPL_VULKAN_NO_PROTOTYPES IMGUI_IMPL_VULKAN_USE_LOADER IMGUI_DISABLE_OBSOLETE_FUNCTIONS IMGUI_USER_CONFIG="gpu/hwder_imconfig.h")
 target_compile_options(hwder PRIVATE ${HW_ARCH_FLAGS} /Z7 /O2 /EHsc -Wno-everything)
 target_link_options(hwder PRIVATE /DEBUG /STACK:16777216 /DYNAMICBASE:NO /FIXED:NO)

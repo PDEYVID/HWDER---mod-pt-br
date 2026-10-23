@@ -21,6 +21,7 @@ extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 
 float hwder_render_scale_x();  // texture_cache.cpp: active internal resolution scale
 float hwder_render_scale_y();
+extern "C" std::atomic<int> hw_shader_precompile_left;  // vk_renderer.cpp: cached pipelines still building
 
 namespace overlay {
 
@@ -340,6 +341,15 @@ static void build_ui(VkExtent2D extent) {
         ImGui::Text("%.0f fps  %.1f ms (worst %.0f)", avg > 0 ? 1000.0 / avg : 0.0, avg, worst);
         ImGui::End();
     }
+    if (int left = hw_shader_precompile_left.load(); left > 0) {
+        ImGui::SetNextWindowPos(ImVec2(8, (float)extent.height - 8), ImGuiCond_Always, ImVec2(0, 1));
+        ImGui::SetNextWindowBgAlpha(0.45f);
+        ImGui::Begin("##shaders", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+        ImGui::Text("Preparing shaders... %d left", left);
+        ImGui::End();
+    }
     if (!g_visible) return;
 
     ImGui::SetNextWindowPos(ImVec2(extent.width * 0.5f, extent.height * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -572,7 +582,7 @@ void render(VkCommandBuffer cb, VkImage image, VkExtent2D extent) {
     settings::Video& v = settings::video();
     if (!g_visible) g_capture_action = -1;
     hid::set_input_block(!g_visible ? 0 : g_capture_action >= 0 ? 2 : 1);
-    if (!g_visible && !v.show_fps) return;
+    if (!g_visible && !v.show_fps && hw_shader_precompile_left.load() <= 0) return;
     auto vit = g_views.find(image);
     if (vit == g_views.end()) return;
     ImGui_ImplVulkan_NewFrame();

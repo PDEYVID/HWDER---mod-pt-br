@@ -177,8 +177,10 @@ public:
     }
     bool open(const std::string& path) {
         std::wstring w = utf8_to_wide(path);
+        // Overlapped: Windows serializes every read on a synchronous handle, so the game's loader threads
+        // and the movie stream queued behind each other (64 KiB reads took 20-60 ms on an NVMe drive).
         h_ = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
         if (h_ == INVALID_HANDLE_VALUE) return false;
         LARGE_INTEGER sz;
         GetFileSizeEx(h_, &sz);
@@ -187,13 +189,16 @@ public:
     }
     u64 size() const { return size_; }
     bool read(u64 off, u8* dst, u64 size) const {
+        thread_local HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         while (size) {
             DWORD chunk = (DWORD)std::min<u64>(size, 0x10000000ull);
             OVERLAPPED ov{};
             ov.Offset = (DWORD)off;
             ov.OffsetHigh = (DWORD)(off >> 32);
+            ov.hEvent = ev;
             DWORD got = 0;
-            if (!ReadFile(h_, dst, chunk, &got, &ov) || got == 0) return false;
+            if (!ReadFile(h_, dst, chunk, nullptr, &ov) && GetLastError() != ERROR_IO_PENDING) return false;
+            if (!GetOverlappedResult(h_, &ov, &got, TRUE) || got == 0) return false;
             dst += got;
             off += got;
             size -= got;

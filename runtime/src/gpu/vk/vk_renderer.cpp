@@ -18,6 +18,9 @@
 #include <condition_variable>
 #include <cmath>
 #include <thread>
+#include <type_traits>
+
+#include "shader_version.h"
 
 #include "shader/shader.h"
 #include "gpu/gpu.h"
@@ -632,6 +635,105 @@ extern "C" std::atomic<u32> hw_last_frame_draws{0};
 static const char* kPipelineCacheFile = "pipeline_cache.bin";
 static const u64 g_start_ms = GetTickCount64();
 
+// ------------------------------------------------------------------ persistent shader cache
+// cache/shaders.bin remembers every translated shader, program and pipeline state the game used. At
+// startup the renderer recreates them (no re-translation) and builds the pipelines on the worker
+// thread while the game boots, so effects neither stall nor skip their first draws in later sessions.
+// The file is tied to the translator version (cmake/shader_version.cmake) and to the device options
+// baked into the SPIR-V; any mismatch starts a new file. HWDER_NO_SHADER_CACHE=1 disables it.
+static const char* kShaderCacheFile = "cache\\shaders.bin";
+enum : u8 { kRecShader = 1, kRecProgram = 2, kRecPipeline = 3 };
+struct ShaderCacheHeader {
+    u32 magic = 0x43535748;  // "HWSC"
+    u32 format = 1;
+    u64 translator = HWDER_SHADER_VERSION;
+    u32 demote = 0;
+    u32 reserved = 0;
+};
+// Pipelines from the cache still being built (shown by the overlay).
+extern "C" std::atomic<int> hw_shader_precompile_left{0};
+
+struct ByteWriter {
+    std::vector<u8> b;
+    template <class T>
+    void put(const T& v) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        const u8* p = (const u8*)&v;
+        b.insert(b.end(), p, p + sizeof(T));
+    }
+    template <class T>
+    void put_vec(const std::vector<T>& v) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        put((u32)v.size());
+        const u8* p = (const u8*)v.data();
+        b.insert(b.end(), p, p + v.size() * sizeof(T));
+    }
+};
+struct ByteReader {
+    const u8* p;
+    const u8* end;
+    bool ok = true;
+    template <class T>
+    T get() {
+        T v{};
+        if ((size_t)(end - p) < sizeof(T)) return ok = false, v;
+        memcpy(&v, p, sizeof(T));
+        p += sizeof(T);
+        return v;
+    }
+    template <class T>
+    std::vector<T> get_vec() {
+        u32 n = get<u32>();
+        std::vector<T> v;
+        if (!ok || (u64)(end - p) < (u64)n * sizeof(T)) return ok = false, v;
+        v.resize(n);
+        memcpy(v.data(), p, (size_t)n * sizeof(T));
+        p += (size_t)n * sizeof(T);
+        return v;
+    }
+};
+
+void write_shader_program(ByteWriter& w, const shader::Program& p) {
+    w.put((u32)p.stage);
+    w.put_vec(p.spirv);
+    w.put_vec(p.resources.const_buffers);
+    w.put_vec(p.resources.storage_buffers);
+    w.put_vec(p.resources.texel_buffers);
+    w.put_vec(p.resources.textures);
+    w.put_vec(p.resources.images);
+    w.put(p.attributes_read);
+    w.put(p.outputs_written);
+    w.put((u8)p.writes_depth);
+    w.put((u8)p.uses_discard);
+    for (u32 s : p.local_size) w.put(s);
+    w.put(p.shared_memory_size);
+    w.put(p.local_memory_size);
+    w.put(p.geometry_output_topology);
+    w.put(p.geometry_max_vertices);
+    w.put(p.geometry_invocations);
+}
+
+bool read_shader_program(ByteReader& r, shader::Program& p) {
+    p.stage = (shader::Stage)r.get<u32>();
+    p.spirv = r.get_vec<u32>();
+    p.resources.const_buffers = r.get_vec<shader::ConstBufferUse>();
+    p.resources.storage_buffers = r.get_vec<shader::StorageBufferUse>();
+    p.resources.texel_buffers = r.get_vec<shader::TextureUse>();
+    p.resources.textures = r.get_vec<shader::TextureUse>();
+    p.resources.images = r.get_vec<shader::ImageUse>();
+    p.attributes_read = r.get<u32>();
+    p.outputs_written = r.get<u32>();
+    p.writes_depth = r.get<u8>() != 0;
+    p.uses_discard = r.get<u8>() != 0;
+    for (u32& s : p.local_size) s = r.get<u32>();
+    p.shared_memory_size = r.get<u32>();
+    p.local_memory_size = r.get<u32>();
+    p.geometry_output_topology = r.get<u32>();
+    p.geometry_max_vertices = r.get<u32>();
+    p.geometry_invocations = r.get<u32>();
+    return r.ok && !p.spirv.empty();
+}
+
 using gpu::vk::g_prof;
 using gpu::vk::g_prof_draws;
 static double prof_flush() {
@@ -677,6 +779,7 @@ public:
         }
         if (!blob.empty()) hw_log("vk: loaded pipeline cache (%zu KiB)", blob.size() >> 10);
         create_dummies();
+        scache_load();
         hw_log("vk: renderer ready (ring %llu MiB)", (unsigned long long)(kRingSize >> 20));
     }
 
@@ -894,12 +997,21 @@ private:
     GfxProgram* get_program(const u32* regs, u64* key_out);
     VkPipeline get_pipeline(GfxProgram* prog, const PipelineKey& key);
     VkPipeline create_pipeline(GfxProgram* prog, const PipelineKey& key);  // worker-thread safe
+    void finish_program(GfxProgram* gp);  // descriptor/pipeline layouts once the stages are set
     void pipeline_worker();
+    void start_pipeline_workers();  // with pipe_m_ held
     struct PipeJob {
         u64 hash;
         GfxProgram* prog;
         PipelineKey key;
+        bool from_cache;  // queued at startup by scache_load()
     };
+    // persistent shader cache (see kShaderCacheFile)
+    FILE* scache_ = nullptr;
+    std::unordered_set<u64> scache_pipes_;  // pipeline hashes already in the file
+    u64 scache_t0_ = 0;
+    void scache_load();
+    void scache_record(u8 type, const ByteWriter& w);
     std::mutex pipe_m_;
     std::condition_variable pipe_cv_;
     std::deque<PipeJob> pipe_jobs_;
@@ -1326,6 +1438,10 @@ ShaderEntry* VkRenderer::get_shader(GuestEnv& env, shader::Stage stage, const sh
         }
     }
     e->ok = true;
+    ByteWriter w;
+    w.put(key);
+    write_shader_program(w, e->prog);
+    scache_record(kRecShader, w);
     return e;
 }
 
@@ -1467,6 +1583,19 @@ GfxProgram* VkRenderer::get_program_slow(const u32* regs, u64* key_out) {
         gp->stages[i - 1] = se;
     }
     if (!gp->stages[0]) return gp;
+    finish_program(gp);
+    ByteWriter w;
+    w.put(key);
+    for (ShaderEntry* se : gp->stages) w.put(se ? se->key : 0ull);
+    scache_record(kRecProgram, w);
+    return gp;
+}
+
+void VkRenderer::finish_program(GfxProgram* gp) {
+    static const VkShaderStageFlagBits vk_stages[5] = {VK_SHADER_STAGE_VERTEX_BIT,
+                                                       VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                                                       VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                                                       VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
     gp->attributes = gp->stages[0]->prog.attributes_read;
     VkDescriptorSetLayout sets[5];
     for (u32 s = 0; s < 5; s++) {
@@ -1482,7 +1611,6 @@ GfxProgram* VkRenderer::get_program_slow(const u32* regs, u64* key_out) {
     pli.pPushConstantRanges = &pc;
     VK_CHECK(vkCreatePipelineLayout(dev(), &pli, nullptr, &gp->layout));
     gp->ok = true;
-    return gp;
 }
 
 VkPipeline VkRenderer::get_pipeline(GfxProgram* prog, const PipelineKey& key) {
@@ -1497,6 +1625,11 @@ VkPipeline VkRenderer::get_pipeline(GfxProgram* prog, const PipelineKey& key) {
     }
     auto it = pipelines_.find(h);
     if (it != pipelines_.end()) return it->second;
+    if (scache_pipes_.insert(h).second) {
+        ByteWriter w;
+        w.put(key);
+        scache_record(kRecPipeline, w);
+    }
     // A driver compile takes 50-250 ms. Instead of stalling the whole frame, build new pipelines on
     // worker threads and skip the draw until the pipeline exists (a one-or-two-frame pop-in, the usual
     // "async shaders" trade). HWDER_SYNC_PIPELINES=1 restores the synchronous behaviour.
@@ -1511,14 +1644,116 @@ VkPipeline VkRenderer::get_pipeline(GfxProgram* prog, const PipelineKey& key) {
     }
     if (pipe_pending_.insert(h).second) {
         std::lock_guard<std::mutex> l(pipe_m_);
-        pipe_jobs_.push_back({h, prog, key});
-        if (pipe_workers_.empty()) {
-            for (int i = 0; i < 1; i++)
-                pipe_workers_.emplace_back([this] { pipeline_worker(); });
-        }
+        pipe_jobs_.push_front({h, prog, key, false});  // ahead of the startup precompile queue
+        start_pipeline_workers();
         pipe_cv_.notify_one();
     }
     return VK_NULL_HANDLE;
+}
+
+void VkRenderer::start_pipeline_workers() {
+    if (pipe_workers_.empty())
+        for (int i = 0; i < 1; i++) pipe_workers_.emplace_back([this] { pipeline_worker(); });
+}
+
+void VkRenderer::scache_record(u8 type, const ByteWriter& w) {
+    if (!scache_) return;
+    u32 size = (u32)w.b.size();
+    fwrite(&type, 1, 1, scache_);
+    fwrite(&size, 4, 1, scache_);
+    fwrite(w.b.data(), 1, size, scache_);
+    fflush(scache_);  // a crash keeps everything recorded so far
+}
+
+void VkRenderer::scache_load() {
+    if (const char* e = getenv("HWDER_NO_SHADER_CACHE"); e && *e && *e != '0') return;
+    CreateDirectoryA("cache", nullptr);
+    ShaderCacheHeader hdr;
+    hdr.demote = display::device().demote_to_helper;
+    std::vector<u8> data;
+    if (FILE* f = fopen(kShaderCacheFile, "rb")) {
+        fseek(f, 0, SEEK_END);
+        data.resize((size_t)ftell(f));
+        fseek(f, 0, SEEK_SET);
+        if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+        fclose(f);
+    }
+    if (!data.empty() && (data.size() < sizeof(hdr) || memcmp(data.data(), &hdr, sizeof(hdr)) != 0)) {
+        hw_log("vk: shader cache: %s was made by another shader translator or GPU setup - starting over", kShaderCacheFile);
+        data.clear();
+    }
+    size_t shaders = 0, programs = 0, good_end = sizeof(hdr);
+    std::vector<PipeJob> jobs;
+    ByteReader r{data.data() + std::min(data.size(), sizeof(hdr)), data.data() + data.size()};
+    while (!data.empty() && r.p < r.end) {
+        u8 type = r.get<u8>();
+        u32 size = r.get<u32>();
+        if (!r.ok || (size_t)(r.end - r.p) < size) break;  // torn tail from a crash: dropped below
+        ByteReader rec{r.p, r.p + size};
+        r.p += size;
+        if (type == kRecShader) {
+            u64 key = rec.get<u64>();
+            auto* e = new ShaderEntry;
+            e->key = key;
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            if (!read_shader_program(rec, e->prog) || shaders_.count(key)) {
+                delete e;
+            } else {
+                ci.codeSize = e->prog.spirv.size() * 4;
+                ci.pCode = e->prog.spirv.data();
+                e->ok = vkCreateShaderModule(dev(), &ci, nullptr, &e->module) == VK_SUCCESS;
+                shaders_[key] = e;
+                shaders++;
+            }
+        } else if (type == kRecProgram) {
+            u64 key = rec.get<u64>();
+            auto* gp = new GfxProgram;
+            bool ok = rec.ok && !programs_.count(key);
+            for (int s = 0; s < 5 && ok; s++) {
+                u64 sk = rec.get<u64>();
+                if (!sk) continue;
+                auto it = shaders_.find(sk);
+                ok = rec.ok && it != shaders_.end() && it->second->ok;
+                if (ok) gp->stages[s] = it->second;
+            }
+            if (!ok || !gp->stages[0]) {
+                delete gp;
+            } else {
+                finish_program(gp);
+                programs_[key] = gp;
+                programs++;
+            }
+        } else if (type == kRecPipeline) {
+            PipelineKey key = rec.get<PipelineKey>();
+            if (!rec.ok) continue;
+            u64 h = hash_bytes(&key, sizeof(key));
+            auto it = programs_.find(key.program);
+            if (it == programs_.end() || !it->second->ok || !scache_pipes_.insert(h).second) continue;
+            pipe_pending_.insert(h);
+            jobs.push_back({h, it->second, key, true});
+        }
+        good_end = r.p - data.data();
+    }
+    // Re-open for appending; rewrite the file first when it is new, stale or ends in a torn record.
+    if (data.size() != good_end || data.empty()) {
+        if (FILE* f = fopen(kShaderCacheFile, "wb")) {
+            fwrite(&hdr, sizeof(hdr), 1, f);
+            if (data.size() > sizeof(hdr)) fwrite(data.data() + sizeof(hdr), 1, good_end - sizeof(hdr), f);
+            fclose(f);
+        }
+    }
+    scache_ = fopen(kShaderCacheFile, "ab");
+    if (!scache_) hw_log("vk: shader cache: cannot write %s", kShaderCacheFile);
+    if (!jobs.empty()) {
+        std::lock_guard<std::mutex> l(pipe_m_);
+        for (auto& j : jobs) pipe_jobs_.push_back(j);
+        hw_shader_precompile_left = (int)jobs.size();
+        scache_t0_ = GetTickCount64();
+        start_pipeline_workers();
+        pipe_cv_.notify_one();
+    }
+    hw_log("vk: shader cache: %zu shaders, %zu programs loaded; building %zu pipelines in the background", shaders, programs,
+           jobs.size());
 }
 
 void VkRenderer::pipeline_worker() {
@@ -1541,6 +1776,8 @@ void VkRenderer::pipeline_worker() {
         }
         std::lock_guard<std::mutex> l(pipe_m_);
         pipe_done_.push_back({job.hash, pipe});
+        if (job.from_cache && --hw_shader_precompile_left == 0)
+            hw_log("vk: shader cache: all pipelines built (%.1f s)", (GetTickCount64() - scache_t0_) / 1000.0);
     }
 }
 

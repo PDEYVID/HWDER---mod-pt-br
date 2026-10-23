@@ -37,6 +37,9 @@ Q/E = L/R, U/O = ZL/ZR, Space = +, Tab = -, 1-4 = D-pad, Z/C = stick clicks.
 
 Files created beside the exe: `hwder_settings.ini`, `hwder.log` (attach to bug reports),
 `save\` (console save layout), `cache\` and `pipeline_cache.bin` (safe to delete).
+`cache\shaders.bin` remembers every shader and pipeline state the game has used: the next launch
+rebuilds them in the background while the game boots ("Preparing shaders" in the corner), so effects
+seen once never stall again. It resets itself when the shader translator changes.
 
 **Mods (e.g. translations):** put each mod in its own folder under `mods\` beside the exe, e.g.
 `mods\PT-BR\data\...`. A mod folder holds the RomFS tree itself, a `romfs\` folder, or an
@@ -227,7 +230,8 @@ docs/              design decisions
 ## Environment variables (debugging)
 
 `HWDER_NSP`, `HWDER_KEYS`, `HWDER_EXEFS`, `HWDER_ROMFS` select the game data; `HWDER_MODS` the
-mods folder (`HWDER_NO_MODS=1` disables mods); `HWDER_LOG` the log file; `HWDER_MUTE=1` silences audio; `HWDER_RES_SCALE` overrides the resolution scale;
+mods folder (`HWDER_NO_MODS=1` disables mods); `HWDER_NO_SHADER_CACHE=1` ignores `cache\shaders.bin`;
+`HWDER_LOG` the log file; `HWDER_MUTE=1` silences audio; `HWDER_RES_SCALE` overrides the resolution scale;
 `HWDER_VALIDATION=1` enables Vulkan validation layers (messages go to `hwder.log`); `HWDER_GPU=<index or
 part of the name>` picks the GPU on multi-GPU systems (the log lists them); `HWDER_EMULATE_AMD=1` makes the
 renderer treat the formats AMD drivers lack (D24S8 depth, 3-component vertex formats) as unsupported, to
