@@ -17,6 +17,8 @@ struct Video {
     bool display_60hz = false;  // switch the monitor to 60 Hz while the game runs (even cadence for 60/30 fps content)
     int language = -1;          // F1 menu: -1 = follow Windows, 0 = English, 1 = Portuguese (Brazil)
     int turbo_speed = 2;        // F2 turbo multiplier: 2, 3 or 4
+    bool fxaa = false;          // post-processing (postfx.cpp): FXAA anti-aliasing
+    int sharpen = 0;            // post-processing: sharpening strength, 0-100
 };
 int ui_language();  // `language` resolved: 0 English, 1 Portuguese
 

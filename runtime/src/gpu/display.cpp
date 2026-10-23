@@ -1,5 +1,6 @@
 // Window + Vulkan device + swapchain presentation, with frame pacing.
 #include "gpu/overlay.h"
+#include "gpu/postfx.h"
 #include "gpu/settings.h"
 #include "display.h"
 
@@ -721,6 +722,13 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
         return;
     }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) return;
+    // Post-processing images follow the game image's size; rebuilt with the device idle (rare).
+    if (src && postfx::enabled() && postfx::needs_rebuild(w, h)) {
+        std::lock_guard<std::mutex> q(g_dev.queue_lock);
+        std::lock_guard<std::mutex> q2(g_present_queue_lock);
+        vkDeviceWaitIdle(g_dev.dev);
+        postfx::rebuild(w, h);
+    }
     vkResetFences(g_dev.dev, 1, &fs.fence);
     vkResetCommandBuffer(fs.cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -746,6 +754,9 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(fs.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkImage blit_src = postfx::enabled() ? postfx::record(fs.cb, src, w, h) : VK_NULL_HANDLE;
+        VkImageLayout blit_layout = blit_src ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        if (!blit_src) blit_src = src;
         float s = std::min((float)g_extent.width / w, (float)g_extent.height / h);
         s32 dw = (s32)(w * s), dh = (s32)(h * s);
         s32 x0 = ((s32)g_extent.width - dw) / 2, y0 = ((s32)g_extent.height - dh) / 2;
@@ -755,8 +766,7 @@ static void present(VkImage src, u32 w, u32 h, const VkClearColorValue& bg, VkSe
         blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.dstOffsets[0] = {x0, y0, 0};
         blit.dstOffsets[1] = {x0 + dw, y0 + dh, 1};
-        vkCmdBlitImage(fs.cb, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                       VK_FILTER_LINEAR);
+        vkCmdBlitImage(fs.cb, blit_src, blit_layout, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
     }
     const bool shot = src && g_shot_request.exchange(false) && shot_resources(w, h);
     if (shot) shot_record(fs.cb, src, w, h);

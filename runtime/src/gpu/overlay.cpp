@@ -129,6 +129,13 @@ static const char* tr(const char* en) {
         {"could not read the save", "não foi possível ler o save"},
         {"Settings are saved to hwder_settings.ini when changed.", "As configurações são salvas no hwder_settings.ini ao mudar."},
         {"Turbo %dx  (F2)", "Turbo %dx  (F2)"},
+        {"Post-processing", "Pós-processamento"},
+        {"FXAA anti-aliasing", "Antisserrilhado FXAA"},
+        {"Smooths jagged edges of the whole picture (cheap, slightly soft). Applies immediately.",
+         "Suaviza os serrilhados da imagem inteira (leve, deixa um pouco mais macio). Aplica na hora."},
+        {"Sharpening", "Nitidez"},
+        {"Restores crispness (good after FXAA or a resolution below the window's). 0 = off.",
+         "Devolve a definição (bom depois do FXAA ou com resolução menor que a janela). 0 = desligada."},
         {"Turbo speed (F2)", "Velocidade do turbo (F2)"},
         {"F2 speeds the whole game up (menus, cutscenes, grinding). Sound may crackle while it is on.",
          "F2 acelera o jogo inteiro (menus, cenas, farm). O som pode falhar enquanto estiver ligado."},
@@ -643,6 +650,16 @@ static void build_ui(VkExtent2D extent) {
                                     v.unlocked_res ? tr("  [unlocked: follows the window]") : "");
             }
         }
+
+        ImGui::SeparatorText(tr("Post-processing"));
+        if (ImGui::Checkbox(tr("FXAA anti-aliasing"), &v.fxaa)) changed = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Smooths jagged edges of the whole picture (cheap, slightly soft). Applies immediately."));
+        if (ImGui::SliderInt(tr("Sharpening"), &v.sharpen, 0, 100, "%d%%")) changed = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Restores crispness (good after FXAA or a resolution below the window's). 0 = off."));
 
         ImGui::SeparatorText("Overlay");
         if (ImGui::Checkbox(tr("Show frame time"), &v.show_fps)) changed = true;
