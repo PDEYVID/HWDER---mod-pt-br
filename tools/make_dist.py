@@ -43,10 +43,12 @@ Requirements
 Controls
 --------
 - Any XInput controller (Xbox pads, or others through Steam Input / DS4Windows).
-- Keyboard: WASD move, arrows camera, K/Enter = A, J/Backspace = B, I = X, L = Y,
+- Keyboard (default): WASD move, arrows camera, K/Enter = A, J/Backspace = B, I = X, L = Y,
   Q/E = L/R, U/O = ZL/ZR, Space = +, Tab = -, 1-4 = D-pad, Z/C = stick clicks.
-- F1   video options (resolution scale, unlocked/ultrawide resolution, vsync, borderless,
-       anisotropic filtering, FPS counter) and the save-file cheats tab.
+- F1   options: Controls tab (rebind keys and controller buttons, face-button layout,
+       deadzones, vibration, camera inversion, input test), Video tab (resolution scale,
+       unlocked/ultrawide resolution, vsync, borderless, anisotropic filtering, FPS counter)
+       and the save-file Cheats tab.
 - F11  toggle borderless fullscreen.
 
 Files created next to the exe

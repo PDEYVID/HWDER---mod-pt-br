@@ -38,4 +38,12 @@ void poll_host_input(HostInput& out);
 // Rumble on the active XInput pad. Amplitudes 0..1 (low band -> big motor, high band -> small motor).
 void set_rumble(float low, float high);
 
+// For the Controls tab of the F1 overlay (any thread).
+PadInput last_input();         // what the last poll sent to the game
+int active_pad();              // XInput slot in use, -1 = none
+bool pad_connected(int slot);
+u32 pad_sources_down();        // settings::PadSource bits currently held on the selected pad
+// What the game may see: 0 = everything, 1 = no keyboard (overlay open), 2 = nothing (binding capture).
+void set_input_block(int level);
+
 }  // namespace hid

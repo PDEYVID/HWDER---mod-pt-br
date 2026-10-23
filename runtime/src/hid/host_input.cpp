@@ -5,6 +5,10 @@
 #include <xinput.h>
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+
+#include "gpu/settings.h"
 
 namespace hid {
 
@@ -18,6 +22,16 @@ bool g_loaded = false;
 int g_active_pad = -1;
 u32 g_probe_counter = 0;
 bool g_pad_present[4] = {true, true, true, true};
+std::atomic<int> g_block{0};
+std::mutex g_last_m;
+PadInput g_last;
+
+// Switch button per settings::Action (stick directions are analog: 0).
+constexpr u64 kActionBits[settings::kActCount] = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    kBtnA, kBtnB, kBtnX, kBtnY, kBtnL, kBtnR, kBtnZL, kBtnZR,
+    kBtnPlus, kBtnMinus, kBtnStickL, kBtnStickR, kBtnUp, kBtnDown, kBtnLeft, kBtnRight,
+};
 
 void load_xinput() {
     if (g_loaded) return;
@@ -36,12 +50,37 @@ void load_xinput() {
     hw_log("hid: XInput not available - keyboard only");
 }
 
-bool key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+bool key(int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
 s32 axis(SHORT v, SHORT dead) {
     if (v > -dead && v < dead) return 0;
     return std::clamp((s32)v, -kStickMax, kStickMax);
 }
+
+bool source_down(const XINPUT_GAMEPAD& g, int src, BYTE trigger) {
+    using namespace settings;
+    switch (src) {
+    case kPadA: return g.wButtons & XINPUT_GAMEPAD_A;
+    case kPadB: return g.wButtons & XINPUT_GAMEPAD_B;
+    case kPadX: return g.wButtons & XINPUT_GAMEPAD_X;
+    case kPadY: return g.wButtons & XINPUT_GAMEPAD_Y;
+    case kPadLB: return g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER;
+    case kPadRB: return g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    case kPadLT: return g.bLeftTrigger > trigger;
+    case kPadRT: return g.bRightTrigger > trigger;
+    case kPadStart: return g.wButtons & XINPUT_GAMEPAD_START;
+    case kPadBack: return g.wButtons & XINPUT_GAMEPAD_BACK;
+    case kPadLS: return g.wButtons & XINPUT_GAMEPAD_LEFT_THUMB;
+    case kPadRS: return g.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB;
+    case kPadDUp: return g.wButtons & XINPUT_GAMEPAD_DPAD_UP;
+    case kPadDDown: return g.wButtons & XINPUT_GAMEPAD_DPAD_DOWN;
+    case kPadDLeft: return g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT;
+    case kPadDRight: return g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT;
+    }
+    return false;
+}
+
+BYTE trigger_threshold() { return (BYTE)std::clamp(settings::input().trigger * 255 / 100, 1, 254); }
 
 }  // namespace
 
@@ -50,11 +89,13 @@ void poll_host_input(HostInput& out) {
     PadInput& s = out.pad;
     s = {};
     out.touch = {};
+    const settings::Input& cfg = settings::input();
+    const int block = g_block.load(std::memory_order_relaxed);
 
     if (g_get_state) {
         // Disconnected pads are expensive to query; re-probe them only every ~0.5 s.
         bool probe = (++g_probe_counter % 100) == 0;
-        g_active_pad = -1;
+        int active = -1;
         for (DWORD i = 0; i < 4; i++) {
             if (!g_pad_present[i] && !probe) continue;
             XINPUT_STATE xs;
@@ -63,63 +104,39 @@ void poll_host_input(HostInput& out) {
                 continue;
             }
             g_pad_present[i] = true;
-            if (g_active_pad >= 0) continue;
-            g_active_pad = (int)i;
+            if (active >= 0 || (cfg.pad_index >= 0 && cfg.pad_index != (int)i)) continue;
+            active = (int)i;
+            if (block >= 2) continue;
             const XINPUT_GAMEPAD& g = xs.Gamepad;
-            // Positional mapping: Xbox bottom/right/left/top = Switch B/A/Y/X.
-            if (g.wButtons & XINPUT_GAMEPAD_A) s.buttons |= kBtnB;
-            if (g.wButtons & XINPUT_GAMEPAD_B) s.buttons |= kBtnA;
-            if (g.wButtons & XINPUT_GAMEPAD_X) s.buttons |= kBtnY;
-            if (g.wButtons & XINPUT_GAMEPAD_Y) s.buttons |= kBtnX;
-            if (g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) s.buttons |= kBtnL;
-            if (g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) s.buttons |= kBtnR;
-            if (g.bLeftTrigger > 64) s.buttons |= kBtnZL;
-            if (g.bRightTrigger > 64) s.buttons |= kBtnZR;
-            if (g.wButtons & XINPUT_GAMEPAD_START) s.buttons |= kBtnPlus;
-            if (g.wButtons & XINPUT_GAMEPAD_BACK) s.buttons |= kBtnMinus;
-            if (g.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) s.buttons |= kBtnStickL;
-            if (g.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) s.buttons |= kBtnStickR;
-            if (g.wButtons & XINPUT_GAMEPAD_DPAD_UP) s.buttons |= kBtnUp;
-            if (g.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) s.buttons |= kBtnDown;
-            if (g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) s.buttons |= kBtnLeft;
-            if (g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) s.buttons |= kBtnRight;
-            s.lx = axis(g.sThumbLX, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-            s.ly = axis(g.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
-            s.rx = axis(g.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
-            s.ry = axis(g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+            BYTE trig = trigger_threshold();
+            for (int a = 0; a < settings::kActCount; a++)
+                if (!settings::is_stick_action(a) && source_down(g, cfg.pad[a], trig)) s.buttons |= kActionBits[a];
+            s.lx = axis(g.sThumbLX, (SHORT)(cfg.deadzone_l * kStickMax / 100));
+            s.ly = axis(g.sThumbLY, (SHORT)(cfg.deadzone_l * kStickMax / 100));
+            s.rx = axis(g.sThumbRX, (SHORT)(cfg.deadzone_r * kStickMax / 100));
+            s.ry = axis(g.sThumbRY, (SHORT)(cfg.deadzone_r * kStickMax / 100));
         }
+        g_active_pad = active;
     }
 
     DWORD fg_pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &fg_pid);
-    if (fg_pid == GetCurrentProcessId()) {
-        // WASD move, arrows camera, K/J/I/L = A/B/X/Y (Enter = A, Backspace = B), Q/E = L/R, U/O = ZL/ZR,
-        // Space/Tab = +/-, 1-4 = D-pad, Z/C = stick clicks.
-        if (key('W')) s.ly = kStickMax;
-        if (key('S')) s.ly = -kStickMax;
-        if (key('A')) s.lx = -kStickMax;
-        if (key('D')) s.lx = kStickMax;
-        if (key(VK_UP)) s.ry = kStickMax;
-        if (key(VK_DOWN)) s.ry = -kStickMax;
-        if (key(VK_LEFT)) s.rx = -kStickMax;
-        if (key(VK_RIGHT)) s.rx = kStickMax;
-        if (key('K') || key(VK_RETURN)) s.buttons |= kBtnA;
-        if (key('J') || key(VK_BACK)) s.buttons |= kBtnB;
-        if (key('I')) s.buttons |= kBtnX;
-        if (key('L')) s.buttons |= kBtnY;
-        if (key('Q')) s.buttons |= kBtnL;
-        if (key('E')) s.buttons |= kBtnR;
-        if (key('U')) s.buttons |= kBtnZL;
-        if (key('O')) s.buttons |= kBtnZR;
-        if (key(VK_SPACE)) s.buttons |= kBtnPlus;
-        if (key(VK_TAB)) s.buttons |= kBtnMinus;
-        if (key('Z')) s.buttons |= kBtnStickL;
-        if (key('C')) s.buttons |= kBtnStickR;
-        if (key('1')) s.buttons |= kBtnUp;
-        if (key('2')) s.buttons |= kBtnDown;
-        if (key('3')) s.buttons |= kBtnLeft;
-        if (key('4')) s.buttons |= kBtnRight;
+    if (fg_pid == GetCurrentProcessId() && block == 0) {
+        // Bindings from the Controls tab (defaults: WASD move, arrows camera, K/J/I/L = A/B/X/Y, ...).
+        auto bound = [&](int a) { return key(cfg.keys[a][0]) || key(cfg.keys[a][1]); };
+        if (bound(settings::kActLUp)) s.ly = kStickMax;
+        if (bound(settings::kActLDown)) s.ly = -kStickMax;
+        if (bound(settings::kActLLeft)) s.lx = -kStickMax;
+        if (bound(settings::kActLRight)) s.lx = kStickMax;
+        if (bound(settings::kActRUp)) s.ry = kStickMax;
+        if (bound(settings::kActRDown)) s.ry = -kStickMax;
+        if (bound(settings::kActRLeft)) s.rx = -kStickMax;
+        if (bound(settings::kActRRight)) s.rx = kStickMax;
+        for (int a = settings::kActA; a < settings::kActCount; a++)
+            if (bound(a)) s.buttons |= kActionBits[a];
     }
+    if (cfg.invert_rx) s.rx = -s.rx;
+    if (cfg.invert_ry) s.ry = -s.ry;
 
     const s32 t = kStickMax / 2;
     if (s.lx < -t) s.buttons |= kBtnStickLLeft;
@@ -130,15 +147,43 @@ void poll_host_input(HostInput& out) {
     if (s.rx > t) s.buttons |= kBtnStickRRight;
     if (s.ry > t) s.buttons |= kBtnStickRUp;
     if (s.ry < -t) s.buttons |= kBtnStickRDown;
+
+    std::lock_guard<std::mutex> l(g_last_m);
+    g_last = s;
 }
 
 void set_rumble(float low, float high) {
     load_xinput();
     if (!g_set_state || g_active_pad < 0) return;
+    float k = std::clamp(settings::input().rumble, 0, 100) / 100.0f;
     XINPUT_VIBRATION v;
-    v.wLeftMotorSpeed = (WORD)(std::clamp(low, 0.0f, 1.0f) * 65535.0f);
-    v.wRightMotorSpeed = (WORD)(std::clamp(high, 0.0f, 1.0f) * 65535.0f);
+    v.wLeftMotorSpeed = (WORD)(std::clamp(low * k, 0.0f, 1.0f) * 65535.0f);
+    v.wRightMotorSpeed = (WORD)(std::clamp(high * k, 0.0f, 1.0f) * 65535.0f);
     g_set_state((DWORD)g_active_pad, &v);
 }
+
+PadInput last_input() {
+    std::lock_guard<std::mutex> l(g_last_m);
+    return g_last;
+}
+
+int active_pad() { return g_active_pad; }
+
+bool pad_connected(int slot) { return slot >= 0 && slot < 4 && g_get_state && g_pad_present[slot]; }
+
+u32 pad_sources_down() {
+    load_xinput();
+    int pad = g_active_pad;
+    if (!g_get_state || pad < 0) return 0;
+    XINPUT_STATE xs;
+    if (g_get_state((DWORD)pad, &xs) != ERROR_SUCCESS) return 0;
+    u32 m = 0;
+    BYTE trig = trigger_threshold();
+    for (int src = 0; src < settings::kPadSourceCount; src++)
+        if (source_down(xs.Gamepad, src, trig)) m |= 1u << src;
+    return m;
+}
+
+void set_input_block(int level) { g_block.store(level, std::memory_order_relaxed); }
 
 }  // namespace hid

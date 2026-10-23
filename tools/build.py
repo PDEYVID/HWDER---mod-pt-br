@@ -48,7 +48,10 @@ def main():
             break
         except OSError:
             time.sleep(1)
-    if not os.path.exists(os.path.join(bdir, "build.ninja")):
+    # A newly made data/hwder.ico (tools/make_icon.py) is only picked up by a fresh configure.
+    icon_new = (os.path.exists(os.path.join(ROOT, "data", "hwder.ico"))
+                and not os.path.exists(os.path.join(bdir, "hwder_icon.rc")))
+    if icon_new or not os.path.exists(os.path.join(bdir, "build.ninja")):
         r = subprocess.run([CMAKE, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={NINJA}", "-DCMAKE_BUILD_TYPE=Release",
                             "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl", ROOT],
                            cwd=bdir, env=env)

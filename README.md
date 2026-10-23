@@ -24,11 +24,16 @@ of your own `.nsp` with your own `prod.keys` at run time. Nothing is extracted t
 Requirements: Windows 10/11 x64, a Vulkan 1.3 driver (NVIDIA, AMD, Intel), an AVX2 CPU, and
 Media Foundation (built into Windows; "N" editions need the Media Feature Pack) for the movies.
 
-In game: **F1** opens the options overlay (frame interpolation for 120/144 Hz displays, internal
-resolution scale, unlocked resolution for ultrawide, vsync, borderless, anisotropic filtering, FPS
-counter, 60 Hz monitor switch, and a save-file cheats tab). **F11** toggles borderless fullscreen. Any XInput controller works;
-keyboard: WASD move, arrows camera, K/Enter = A, J/Backspace = B, I = X, L = Y, Q/E = L/R,
-U/O = ZL/ZR, Space = +, Tab = -, 1-4 = D-pad, Z/C = stick clicks.
+In game: **F1** opens the options overlay. Its **Controls** tab rebinds every Switch input to
+two keyboard keys and a controller button (click a binding, press the key/button; right-click
+clears), picks the controller, switches the face-button layout (Switch positions or Xbox labels),
+sets stick deadzones, trigger threshold, vibration strength and camera inversion, and has a live
+input test. The **Video** tab has frame interpolation for 120/144 Hz displays, the internal
+resolution scale, unlocked resolution for
+ultrawide, vsync, borderless, anisotropic filtering, FPS counter and the 60 Hz monitor switch;
+**Cheats** edits the save file. **F11** toggles borderless fullscreen. Any XInput controller
+works; default keyboard: WASD move, arrows camera, K/Enter = A, J/Backspace = B, I = X, L = Y,
+Q/E = L/R, U/O = ZL/ZR, Space = +, Tab = -, 1-4 = D-pad, Z/C = stick clicks.
 
 Files created beside the exe: `hwder_settings.ini`, `hwder.log` (attach to bug reports),
 `save\` (console save layout), `cache\` and `pipeline_cache.bin` (safe to delete).
@@ -58,7 +63,9 @@ python tools/nx_extract.py "<game>.nsp" "<prod.keys>" data --no-romfs
 # 2. ARM64 -> C (all five ExeFS modules, ~5 minutes, writes generated/)
 cd tools && python -m recomp.gen_main && cd ..
 
-# 3. build (clang-cl + Ninja inside the VS developer environment)
+# 3. build (clang-cl + Ninja inside the VS developer environment). Optional: an exe icon,
+#    from the game's own icon in your dump or any image you pass (needs Pillow; never committed)
+python tools/make_icon.py
 python tools/build.py
 
 # 4. run: drop your .nsp + prod.keys next to build/release/hwder.exe, or point at a dump

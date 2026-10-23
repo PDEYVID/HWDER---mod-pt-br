@@ -36,6 +36,13 @@ set(RUNTIME_SOURCES
 foreach(sub hid fs audio gpu gpu/vk shader video)
     include(${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/${sub}/sources.cmake)
 endforeach()
+# Exe/window icon, built from the user's own dump by tools/make_icon.py (never committed).
+set(HW_ICON ${CMAKE_SOURCE_DIR}/data/hwder.ico)
+if(EXISTS ${HW_ICON})
+    file(WRITE ${CMAKE_BINARY_DIR}/hwder_icon.rc "1 ICON \"${HW_ICON}\"\n")
+    list(APPEND RUNTIME_SOURCES ${CMAKE_BINARY_DIR}/hwder_icon.rc)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${HW_ICON})
+endif()
 add_executable(hwder ${RUNTIME_SOURCES})
 target_link_libraries(hwder PRIVATE hwder_game dbghelp winmm synchronization psapi bcrypt)
 target_include_directories(hwder PRIVATE runtime/src ${TP}/vulkan-headers/include ${TP}/spirv-headers/include ${TP}/imgui ${TP}/imgui/backends)

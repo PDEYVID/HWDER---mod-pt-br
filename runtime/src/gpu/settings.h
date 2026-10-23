@@ -17,7 +17,44 @@ struct Video {
     bool display_60hz = false;  // switch the monitor to 60 Hz while the game runs (even cadence for 60/30 fps content)
 };
 
+// Switch-side inputs that can be bound, in the order the Controls tab lists them.
+enum Action : int {
+    kActLUp, kActLDown, kActLLeft, kActLRight,
+    kActRUp, kActRDown, kActRLeft, kActRRight,
+    kActA, kActB, kActX, kActY,
+    kActL, kActR, kActZL, kActZR,
+    kActPlus, kActMinus, kActLClick, kActRClick,
+    kActDUp, kActDDown, kActDLeft, kActDRight,
+    kActCount
+};
+constexpr bool is_stick_action(int a) { return a <= kActRRight; }
+const char* action_name(int a);
+
+// XInput sources a Switch button can be bound to.
+enum PadSource : int {
+    kPadNone = -1,
+    kPadA, kPadB, kPadX, kPadY, kPadLB, kPadRB, kPadLT, kPadRT,
+    kPadStart, kPadBack, kPadLS, kPadRS, kPadDUp, kPadDDown, kPadDLeft, kPadDRight,
+    kPadSourceCount
+};
+const char* pad_source_name(int s);
+
+struct Input {
+    int keys[kActCount][2] = {};  // virtual-key codes (primary, alternate); 0 = unbound
+    int pad[kActCount] = {};      // PadSource per button action; stick directions always come from the sticks
+    int pad_index = -1;           // XInput slot 0-3, -1 = first connected
+    int deadzone_l = 24;          // stick deadzones, percent of full deflection
+    int deadzone_r = 26;
+    int trigger = 25;             // ZL/ZR press threshold, percent of trigger travel
+    bool invert_rx = false;       // camera axes
+    bool invert_ry = false;
+    int rumble = 100;             // vibration strength, percent (0 = off)
+};
+void default_keys(Input& in);
+void default_pad(Input& in, bool xbox_labels);  // false: Switch positions (Xbox A = Switch B), true: same labels
+
 Video& video();
+Input& input();
 void load();
 void save();
 double refresh_hz();  // `refresh` resolved against the display when it is 0
