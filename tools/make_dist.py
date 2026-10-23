@@ -88,6 +88,24 @@ res_scale=1.000
 unlocked_res=0
 show_fps=0
 interp_hz=0
+show_launcher=1
+"""
+
+MODS_README = r"""Mods and translations
+=====================
+Put each mod in its own folder here, for example:
+
+    mods\PT-BR\data\...
+
+A mod folder holds the game's RomFS tree itself (data\...), a romfs\ folder, or an Atmosphere
+layout (atmosphere\contents\0100AE00096EA000\romfs). Files replace the game's files at the same
+path; the NSP is never modified. The launcher lists every folder here with a checkbox (unchecked
+= the folder gets a leading _ and is skipped).
+
+Mods e traduções
+================
+Coloque cada mod numa pasta própria aqui, por exemplo mods\PT-BR\data\... . O launcher lista
+cada pasta com uma caixa de seleção (desmarcado = a pasta ganha _ no nome e é ignorada).
 """
 
 
@@ -129,7 +147,7 @@ SYSTEM_DLLS = {"kernel32.dll", "user32.dll", "gdi32.dll", "advapi32.dll", "shell
                "dbghelp.dll", "winmm.dll", "psapi.dll", "bcrypt.dll", "ws2_32.dll", "shlwapi.dll", "mf.dll", "mfplat.dll",
                "mfreadwrite.dll", "mfuuid.dll", "imm32.dll", "dwmapi.dll", "synchronization.dll", "ntdll.dll", "xinput1_4.dll",
                "xinput9_1_0.dll", "mmdevapi.dll", "avrt.dll", "ksuser.dll", "d3d11.dll", "dxgi.dll", "setupapi.dll", "hid.dll",
-               "api-ms-win-core-synch-l1-2-0.dll"}
+               "api-ms-win-core-synch-l1-2-0.dll", "comctl32.dll", "comdlg32.dll", "windowscodecs.dll"}
 
 
 def main():
@@ -138,7 +156,15 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "dist"))
     ap.add_argument("--name", default="HWDER-" + datetime.date.today().isoformat())
     ap.add_argument("--no-pdb", action="store_true")
+    ap.add_argument("--with-icon", action="store_true",
+                    help="allow an exe whose icon was made from game art (personal copies only, never publish it)")
     a = ap.parse_args()
+    # data/hwder.ico comes from the user's dump (or their own picture of the game's art): an exe built
+    # with it must not be published. Rebuild without data/hwder.ico for a public zip.
+    if os.path.exists(os.path.join(a.build, "hwder_icon.rc")) and not a.with_icon:
+        sys.exit("hwder.exe embeds data/hwder.ico (game art). For a public release delete data/hwder.ico and\n"
+                 "build/release/hwder_icon.rc, rebuild, and package again; --with-icon packages it anyway for\n"
+                 "personal use.")
 
     exe = os.path.join(a.build, "hwder.exe")
     if not os.path.exists(exe):
@@ -168,11 +194,16 @@ def main():
     with open(os.path.join(stage, "hwder_settings.ini"), "w", encoding="utf-8") as f:
         f.write(DEFAULT_SETTINGS)
     open(os.path.join(stage, "PUT_YOUR_NSP_AND_prod.keys_HERE"), "w").close()
+    os.makedirs(os.path.join(stage, "mods"))
+    with open(os.path.join(stage, "mods", "README.txt"), "w", encoding="utf-8") as f:
+        f.write(MODS_README)
 
     zpath = os.path.join(a.out, a.name + ".zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        for fn in sorted(os.listdir(stage)):
-            z.write(os.path.join(stage, fn), os.path.join(a.name, fn))
+        for d, _, files in os.walk(stage):
+            for fn in sorted(files):
+                full = os.path.join(d, fn)
+                z.write(full, os.path.join(a.name, os.path.relpath(full, stage)))
     print("dist:", zpath, f"({os.path.getsize(zpath) / 1e6:.1f} MB)")
 
 
