@@ -7,6 +7,7 @@ save/
 save_reference/
 exefs/
 romfs/
+mods/
 
 # generated code (produced from the user's own dump by tools/recomp)
 generated/

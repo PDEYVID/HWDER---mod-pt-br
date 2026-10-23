@@ -56,6 +56,13 @@ Files created next to the exe
   save\\                  save data (same layout as the console's)
   cache\\, pipeline_cache.bin   shader/texture caches; safe to delete
 
+Mods (translations etc.)
+------------------------
+Put each mod in its own folder under mods\\ next to the exe, e.g. mods\\PT-BR\\data\\...
+(a romfs\\ folder or an atmosphere\\contents\\0100AE00096EA000\\romfs layout also works).
+Mod files replace the game's files at the same path; the NSP itself is never modified.
+Rename a mod folder to start with _ to disable it.
+
 Troubleshooting
 ---------------
 - "No game data found": the .nsp or prod.keys is not next to hwder.exe.

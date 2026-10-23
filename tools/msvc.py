@@ -7,14 +7,33 @@ import os
 import subprocess
 import tempfile
 
-VCVARS = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+DEFAULT_VS = r"C:\Program Files\Microsoft Visual Studio\2022\Community"
+VSWHERE = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                       "Microsoft Visual Studio", "Installer", "vswhere.exe")
 _env_cache = None
+_root_cache = None
+
+
+def vs_root():
+    """Newest Visual Studio / Build Tools install with the C++ tools (any edition or version)."""
+    global _root_cache
+    if _root_cache is None:
+        _root_cache = DEFAULT_VS
+        if os.path.exists(VSWHERE):
+            out = subprocess.run([VSWHERE, "-all", "-prerelease", "-products", "*", "-sort", "-property",
+                                  "installationPath"], capture_output=True, text=True).stdout
+            for p in out.splitlines():
+                if os.path.exists(os.path.join(p.strip(), "VC", "Auxiliary", "Build", "vcvars64.bat")):
+                    _root_cache = p.strip()
+                    break
+    return _root_cache
 
 
 def vs_env():
     global _env_cache
     if _env_cache is None:
-        out = subprocess.run(f'cmd /c ""{VCVARS}" >nul && set"', capture_output=True, text=True,
+        vcvars = os.path.join(vs_root(), "VC", "Auxiliary", "Build", "vcvars64.bat")
+        out = subprocess.run(f'cmd /c ""{vcvars}" >nul && set"', capture_output=True, text=True,
                              shell=False).stdout
         env = {}
         for line in out.splitlines():

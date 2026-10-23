@@ -7,10 +7,16 @@
 //
 // Image layout:  [header 0x50][pad to 0x200][file data, each file 0x10-aligned]
 //                [dir hash table][dir entries][file hash table][file entries]
+//
+// Mods (LayeredFS): every folder in mods\ beside the exe is overlaid onto the RomFS in name order,
+// later folders winning; a mod file replaces the game file at the same path or is added. With an
+// NSP the base tree comes from the NSP's own RomFS metadata and its file data keeps its original
+// offsets (served from the NSP as one region); only the mod files are appended after it.
 #include <windows.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <memory>
 #include <vector>
@@ -70,47 +76,23 @@ struct BDir {
 };
 struct BFile {
     std::string name;
-    std::wstring host;
+    std::wstring host;  // empty: data lives in the NSP RomFS at `src`
     u32 parent = 0;
     u64 size = 0;
+    u64 src = 0;   // NSP-backed: offset relative to the NSP's file data start
     u64 data = 0;  // relative to file data start
     u32 off = 0;
 };
 
-class RomFsImage {
-public:
-    bool build(const std::wstring& root);
-    Result read(u64 off, u8* dst, u64 size);
-    u64 size() const { return total_; }
-    size_t file_count() const { return files_.size(); }
-    std::string describe(u64 off) const;  // what an image offset maps to (tracing)
-    void self_test();                     // HWDER_FS_SELFTEST: parse the image like the SDK does
+using HostEntries = std::vector<std::pair<std::string, WIN32_FIND_DATAW>>;
 
-private:
-    void scan(u32 dir_idx);
-    HANDLE handle(u32 file);
-    bool read_host(u32 file, u64 off, u8* dst, u64 size);
-
-    std::vector<BDir> dirs_;
-    std::vector<BFile> files_;
-    std::vector<u8> head_;  // [0, kDataStart)
-    std::vector<u8> meta_;  // [meta_start_, total_)
-    u64 meta_start_ = 0, total_ = 0;
-    struct Span {
-        u64 start, size;  // absolute image offsets
-        u32 file;
-    };
-    std::vector<Span> spans_;  // non-empty files in data order
-    std::unique_ptr<std::atomic<HANDLE>[]> handles_;
-};
-
-void RomFsImage::scan(u32 di) {
-    std::wstring pattern = dirs_[di].host + L"\\*";
+// Sub-directories and files of a host directory, each sorted by name.
+void list_host_dir(const std::wstring& dir, HostEntries& sub_dirs, HostEntries& sub_files) {
+    std::wstring pattern = dir + L"\\*";
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
                                 FIND_FIRST_EX_LARGE_FETCH);
     if (h == INVALID_HANDLE_VALUE) return;
-    std::vector<std::pair<std::string, WIN32_FIND_DATAW>> sub_dirs, sub_files;
     do {
         if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
         std::string name = wide_to_utf8(fd.cFileName);
@@ -121,6 +103,54 @@ void RomFsImage::scan(u32 di) {
     auto by_name = [](const auto& a, const auto& b) { return a.first < b.first; };
     std::sort(sub_dirs.begin(), sub_dirs.end(), by_name);
     std::sort(sub_files.begin(), sub_files.end(), by_name);
+}
+
+bool is_dir(const std::wstring& p) {
+    DWORD attr = GetFileAttributesW(p.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+bool same_name_nocase(const std::string& a, const std::string& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+               return tolower((unsigned char)x) == tolower((unsigned char)y);
+           });
+}
+
+class RomFsImage {
+public:
+    bool build(const std::wstring& root, bool from_nsp, const std::vector<std::wstring>& mods);
+    Result read(u64 off, u8* dst, u64 size);
+    u64 size() const { return total_; }
+    size_t file_count() const { return files_.size(); }
+    std::string describe(u64 off) const;  // what an image offset maps to (tracing)
+    void self_test();                     // HWDER_FS_SELFTEST: parse the image like the SDK does
+
+private:
+    void scan(u32 dir_idx);
+    bool load_nsp();
+    void overlay(const std::wstring& host, u32 dir_idx, size_t& replaced, size_t& added);
+    HANDLE handle(u32 file);
+    bool read_host(u32 file, u64 off, u8* dst, u64 size);
+    bool read_file(u32 file, u64 off, u8* dst, u64 size);
+
+    std::vector<BDir> dirs_;
+    std::vector<BFile> files_;
+    std::vector<u8> head_;  // [0, kDataStart)
+    std::vector<u8> meta_;  // [meta_start_, total_)
+    u64 meta_start_ = 0, total_ = 0;
+    u64 nsp_data_off_ = 0;  // NSP RomFS file data offset
+    u64 nsp_extent_ = 0;    // [kDataStart, kDataStart + nsp_extent_) is served from the NSP as-is
+    struct Span {
+        u64 start, size;  // absolute image offsets
+        u32 file;
+    };
+    std::vector<Span> spans_;  // non-empty files in data order
+    std::unique_ptr<std::atomic<HANDLE>[]> handles_;
+};
+
+void RomFsImage::scan(u32 di) {
+    HostEntries sub_dirs, sub_files;
+    list_host_dir(dirs_[di].host, sub_dirs, sub_files);
     for (auto& [name, f] : sub_files) {
         BFile bf;
         bf.name = name;
@@ -143,12 +173,121 @@ void RomFsImage::scan(u32 di) {
     for (u32 c : children) scan(c);
 }
 
-bool RomFsImage::build(const std::wstring& root) {
-    DWORD attr = GetFileAttributesW(root.c_str());
-    bool exists = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+// Base tree from the NSP's own RomFS metadata (the same tables the SDK walks).
+bool RomFsImage::load_nsp() {
+    RomFsHeader h{};
+    if (!nsp::romfs_read(0, (u8*)&h, sizeof(h)) || h.header_size != sizeof(RomFsHeader)) {
+        hw_log("romfs: NSP RomFS header unreadable");
+        return false;
+    }
+    std::vector<u8> dmeta((size_t)h.dir_meta_size), fmeta((size_t)h.file_meta_size);
+    if (!nsp::romfs_read(h.dir_meta_offset, dmeta.data(), dmeta.size()) ||
+        !nsp::romfs_read(h.file_meta_offset, fmeta.data(), fmeta.size())) {
+        hw_log("romfs: NSP RomFS metadata unreadable");
+        return false;
+    }
+    nsp_data_off_ = h.file_data_offset;
+    auto rd32 = [](const std::vector<u8>& v, u64 off) {
+        u32 x;
+        memcpy(&x, v.data() + off, 4);
+        return x;
+    };
+    bool ok = true;
+    auto walk = [&](auto& self, u32 dir_off, u32 di, int depth) -> void {
+        if (depth > 64 || (u64)dir_off + 0x18 > dmeta.size()) return void(ok = false);
+        for (u32 f = rd32(dmeta, dir_off + 0x0C); f != kEmpty;) {
+            if ((u64)f + 0x20 > fmeta.size()) return void(ok = false);
+            u32 name_size = rd32(fmeta, f + 0x1C);
+            if ((u64)f + 0x20 + name_size > fmeta.size()) return void(ok = false);
+            BFile bf;
+            bf.name.assign((const char*)fmeta.data() + f + 0x20, name_size);
+            bf.parent = di;
+            memcpy(&bf.src, fmeta.data() + f + 0x08, 8);
+            memcpy(&bf.size, fmeta.data() + f + 0x10, 8);
+            nsp_extent_ = std::max(nsp_extent_, bf.src + bf.size);
+            dirs_[di].files.push_back((u32)files_.size());
+            files_.push_back(std::move(bf));
+            f = rd32(fmeta, f + 0x04);
+        }
+        for (u32 c = rd32(dmeta, dir_off + 0x08); c != kEmpty;) {
+            if ((u64)c + 0x18 > dmeta.size()) return void(ok = false);
+            u32 name_size = rd32(dmeta, c + 0x14);
+            if ((u64)c + 0x18 + name_size > dmeta.size()) return void(ok = false);
+            BDir bd;
+            bd.name.assign((const char*)dmeta.data() + c + 0x18, name_size);
+            bd.parent = di;
+            u32 ci = (u32)dirs_.size();
+            dirs_[di].dirs.push_back(ci);
+            dirs_.push_back(std::move(bd));
+            self(self, c, ci, depth + 1);
+            c = rd32(dmeta, c + 0x04);
+        }
+    };
+    walk(walk, 0, 0, 0);
+    if (!ok) hw_log("romfs: NSP RomFS metadata is malformed");
+    return ok;
+}
+
+// Lays a mod directory over directory `di`: same-named files are replaced, new ones added.
+void RomFsImage::overlay(const std::wstring& host, u32 di, size_t& replaced, size_t& added) {
+    HostEntries sub_dirs, sub_files;
+    list_host_dir(host, sub_dirs, sub_files);
+    // Exact name first; a case-only difference (Windows tools often change case) still replaces.
+    auto find = [](const std::string& name, const std::vector<u32>& ids, auto&& name_of) -> u32 {
+        for (u32 i : ids)
+            if (name_of(i) == name) return i;
+        for (u32 i : ids)
+            if (same_name_nocase(name_of(i), name)) return i;
+        return kEmpty;
+    };
+    for (auto& [name, f] : sub_files) {
+        std::wstring path = host + L"\\" + f.cFileName;
+        u64 size = ((u64)f.nFileSizeHigh << 32) | f.nFileSizeLow;
+        u32 fi = find(name, dirs_[di].files, [&](u32 i) -> const std::string& { return files_[i].name; });
+        if (fi != kEmpty) {
+            files_[fi].host = std::move(path);
+            files_[fi].size = size;
+            replaced++;
+            continue;
+        }
+        BFile bf;
+        bf.name = name;
+        bf.host = std::move(path);
+        bf.parent = di;
+        bf.size = size;
+        dirs_[di].files.push_back((u32)files_.size());
+        files_.push_back(std::move(bf));
+        added++;
+    }
+    for (auto& [name, f] : sub_dirs) {
+        u32 ci = find(name, dirs_[di].dirs, [&](u32 i) -> const std::string& { return dirs_[i].name; });
+        if (ci == kEmpty) {
+            BDir bd;
+            bd.name = name;
+            bd.parent = di;
+            ci = (u32)dirs_.size();
+            dirs_[di].dirs.push_back(ci);
+            dirs_.push_back(std::move(bd));
+        }
+        overlay(host + L"\\" + f.cFileName, ci, replaced, added);
+    }
+}
+
+bool RomFsImage::build(const std::wstring& root, bool from_nsp, const std::vector<std::wstring>& mods) {
     dirs_.push_back(BDir{});
     dirs_[0].host = root;
-    if (exists) scan(0);
+    bool exists;
+    if (from_nsp) {
+        exists = load_nsp();
+    } else {
+        exists = is_dir(root);
+        if (exists) scan(0);
+    }
+    for (const std::wstring& m : mods) {
+        size_t replaced = 0, added = 0;
+        overlay(m, 0, replaced, added);
+        hw_log("mods: %s: %zu files replaced, %zu added", wide_to_utf8(m).c_str(), replaced, added);
+    }
 
     // Entry offsets: directories breadth-first-ish (creation order), files grouped per directory.
     u32 dir_meta = 0;
@@ -156,9 +295,10 @@ bool RomFsImage::build(const std::wstring& root) {
         d.off = dir_meta;
         dir_meta += 0x18 + align4((u32)d.name.size());
     }
-    // Files: order of their directories, so siblings are contiguous.
+    // Files: order of their directories, so siblings are contiguous. NSP-backed files keep their
+    // original data offsets; host files (directory mode, mods) are laid out after them.
     u32 file_meta = 0;
-    u64 data = 0;
+    u64 data = nsp_extent_;
     std::vector<u32> data_order;
     data_order.reserve(files_.size());
     for (auto& d : dirs_)
@@ -166,6 +306,10 @@ bool RomFsImage::build(const std::wstring& root) {
             BFile& f = files_[fi];
             f.off = file_meta;
             file_meta += 0x20 + align4((u32)f.name.size());
+            if (f.host.empty()) {
+                f.data = f.src;
+                continue;
+            }
             data = (data + kFileAlign - 1) & ~(kFileAlign - 1);
             f.data = data;
             data += f.size;
@@ -279,6 +423,11 @@ bool RomFsImage::read_host(u32 fi, u64 off, u8* dst, u64 size) {
     return true;
 }
 
+bool RomFsImage::read_file(u32 fi, u64 off, u8* dst, u64 size) {
+    if (!files_[fi].host.empty()) return read_host(fi, off, dst, size);
+    return nsp::romfs_read(nsp_data_off_ + files_[fi].src + off, dst, size);
+}
+
 Result RomFsImage::read(u64 off, u8* dst, u64 size) {
     if (off > total_) return ResultOutOfRange;
     if (size > total_ - off) {
@@ -293,6 +442,14 @@ Result RomFsImage::read(u64 off, u8* dst, u64 size) {
         } else if (off >= meta_start_) {
             n = size;
             memcpy(dst, meta_.data() + (off - meta_start_), (size_t)n);
+        } else if (off < kDataStart + nsp_extent_) {
+            n = std::min<u64>(size, kDataStart + nsp_extent_ - off);
+            if (!nsp::romfs_read(nsp_data_off_ + (off - kDataStart), dst, n)) {
+                static std::atomic<int> warned{0};
+                if (warned++ < 16)
+                    hw_log("romfs: nsp read failed at 0x%llx size 0x%llx", (unsigned long long)off, (unsigned long long)n);
+                memset(dst, 0, (size_t)n);
+            }
         } else {
             // Last span starting at or before off.
             auto it = std::upper_bound(spans_.begin(), spans_.end(), off,
@@ -323,6 +480,7 @@ Result RomFsImage::read(u64 off, u8* dst, u64 size) {
 std::string RomFsImage::describe(u64 off) const {
     if (off < kDataStart) return "[header]";
     if (off >= meta_start_) return "[metadata]";
+    if (off < kDataStart + nsp_extent_) return "[nsp]";
     auto it = std::upper_bound(spans_.begin(), spans_.end(), off, [](u64 v, const Span& s) { return v < s.start; });
     if (it == spans_.begin()) return "[pad]";
     const Span& s = *(it - 1);
@@ -388,7 +546,7 @@ void RomFsImage::self_test() {
                 u64 n = std::min<u64>(size, a.size());
                 u64 pos = tail ? size - n : 0;
                 read(h.file_data_offset + off + pos, a.data(), n);
-                good = read_host((u32)fi, pos, b.data(), n) && !memcmp(a.data(), b.data(), (size_t)n);
+                good = read_file((u32)fi, pos, b.data(), n) && !memcmp(a.data(), b.data(), (size_t)n);
             }
         }
         if (good) ok++;
@@ -398,6 +556,50 @@ void RomFsImage::self_test() {
     hw_log("romfs: selftest: %zu ok, %zu failed (%.0f ms)", ok, bad, ms);
 }
 
+// RomFS roots of the mods in mods\ beside the exe (HWDER_MODS overrides the folder, HWDER_NO_MODS=1
+// disables them), in name order. A mod is a folder holding the RomFS tree itself, a romfs\ folder,
+// or an Atmosphere layout (atmosphere\contents\<title>\romfs). Folders starting with '_' or '.'
+// are skipped, so renaming one disables it.
+const std::vector<std::wstring>& mod_roots() {
+    static std::vector<std::wstring> roots = [] {
+        std::vector<std::wstring> v;
+        if (const char* e = getenv("HWDER_NO_MODS"); e && *e && *e != '0') {
+            hw_log("mods: disabled (HWDER_NO_MODS)");
+            return v;
+        }
+        std::wstring base = exe_dir() + L"\\mods";
+        if (const wchar_t* e = _wgetenv(L"HWDER_MODS"); e && *e) {
+            wchar_t full[32768];
+            DWORD n = GetFullPathNameW(e, 32768, full, nullptr);
+            base = n && n < 32768 ? full : e;
+            while (!base.empty() && (base.back() == L'\\' || base.back() == L'/')) base.pop_back();
+            if (base.rfind(L"\\\\", 0) != 0) base = L"\\\\?\\" + base;
+        }
+        HostEntries sub_dirs, sub_files;
+        list_host_dir(base, sub_dirs, sub_files);
+        for (auto& [name, fd] : sub_dirs) {
+            if (name[0] == '_' || name[0] == '.') {
+                hw_log("mods: '%s' skipped (disabled)", name.c_str());
+                continue;
+            }
+            std::wstring dir = base + L"\\" + fd.cFileName, root = dir;
+            for (const wchar_t* sub : {L"\\romfs", L"\\atmosphere\\contents\\0100AE00096EA000\\romfs",
+                                       L"\\contents\\0100AE00096EA000\\romfs", L"\\0100AE00096EA000\\romfs"})
+                if (is_dir(dir + sub)) {
+                    root = dir + sub;
+                    break;
+                }
+            hw_log("mods: '%s' -> %s", name.c_str(), wide_to_utf8(root).c_str());
+            v.push_back(std::move(root));
+        }
+        return v;
+    }();
+    return roots;
+}
+
+// The NSP's RomFS is passed through untouched unless mods have to be layered over it.
+bool nsp_passthrough() { return nsp::active() && mod_roots().empty(); }
+
 RomFsImage* g_image = nullptr;
 std::once_flag g_image_once;
 
@@ -406,7 +608,7 @@ RomFsImage* image() {
         auto* img = new RomFsImage;
         auto t0 = std::chrono::steady_clock::now();
         const std::wstring& root = romfs_host_dir();
-        if (!img->build(root))
+        if (!img->build(root, nsp::active(), mod_roots()) && !nsp::active())
             hw_log("romfs: directory '%s' not found - RomFS will be empty", wide_to_utf8(root).c_str());
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         hw_log("romfs: built virtual image: %zu files, %.2f GiB, in %.1f ms", img->file_count(),
@@ -445,7 +647,7 @@ public:
                 }
             } read_timer{&rt0, &rf, off, size};
             (void)rt1;
-            if (nsp::active()) {  // served straight out of the NSP's program NCA
+            if (nsp_passthrough()) {  // served straight out of the NSP's program NCA
                 if (!nsp::romfs_read(off, (u8*)b.addr, size)) {
                     static std::atomic<int> warned{0};
                     if (warned++ < 16) hw_log("fs: nsp romfs read 0x%llx+0x%llx FAILED", (unsigned long long)off, (unsigned long long)size);
@@ -463,7 +665,7 @@ public:
         reg(1, [](Request&, Response& rs) { rs.result = ResultUnsupportedOperation; });  // Write
         reg(2, [](Request&, Response&) {});                                             // Flush
         reg(3, [](Request&, Response& rs) { rs.result = ResultUnsupportedOperation; });  // SetSize
-        reg(4, [](Request&, Response& rs) { rs.push<u64>(nsp::active() ? nsp::romfs_size() : image()->size()); });  // GetSize
+        reg(4, [](Request&, Response& rs) { rs.push<u64>(nsp_passthrough() ? nsp::romfs_size() : image()->size()); });  // GetSize
         reg(5, [](Request&, Response& rs) {                                             // OperateRange
             u8 info[0x40] = {};
             rs.data.insert(rs.data.end(), info, info + sizeof(info));
@@ -491,7 +693,7 @@ const std::wstring& romfs_host_dir() {
 }
 
 ServicePtr open_romfs_storage() {
-    if (!nsp::active()) image();
+    if (!nsp_passthrough()) image();
     return std::make_shared<IStorage>();
 }
 

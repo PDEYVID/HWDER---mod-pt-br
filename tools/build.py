@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import msvc  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VSCM = r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake"
+VSCM = os.path.join(msvc.vs_root(), "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake")
 CMAKE = os.path.join(VSCM, "CMake", "bin", "cmake.exe")
 NINJA = os.path.join(VSCM, "Ninja", "ninja.exe")
 

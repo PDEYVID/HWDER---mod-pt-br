@@ -33,6 +33,13 @@ U/O = ZL/ZR, Space = +, Tab = -, 1-4 = D-pad, Z/C = stick clicks.
 Files created beside the exe: `hwder_settings.ini`, `hwder.log` (attach to bug reports),
 `save\` (console save layout), `cache\` and `pipeline_cache.bin` (safe to delete).
 
+**Mods (e.g. translations):** put each mod in its own folder under `mods\` beside the exe, e.g.
+`mods\PT-BR\data\...`. A mod folder holds the RomFS tree itself, a `romfs\` folder, or an
+Atmosphere layout (`atmosphere\contents\0100AE00096EA000\romfs`), so Switch LayeredFS mods work
+unchanged. A mod file replaces the game's file at the same path (or is added); mods load in folder
+name order, later ones winning. Rename a folder to start with `_` to disable it. The NSP is never
+modified; `hwder.log` lists each mod and how many files it replaced.
+
 ---
 
 ## Building from source
@@ -212,8 +219,8 @@ docs/              design decisions
 
 ## Environment variables (debugging)
 
-`HWDER_NSP`, `HWDER_KEYS`, `HWDER_EXEFS`, `HWDER_ROMFS` select the game data; `HWDER_LOG` the
-log file; `HWDER_MUTE=1` silences audio; `HWDER_RES_SCALE` overrides the resolution scale;
+`HWDER_NSP`, `HWDER_KEYS`, `HWDER_EXEFS`, `HWDER_ROMFS` select the game data; `HWDER_MODS` the
+mods folder (`HWDER_NO_MODS=1` disables mods); `HWDER_LOG` the log file; `HWDER_MUTE=1` silences audio; `HWDER_RES_SCALE` overrides the resolution scale;
 `HWDER_VALIDATION=1` enables Vulkan validation layers (messages go to `hwder.log`); `HWDER_GPU=<index or
 part of the name>` picks the GPU on multi-GPU systems (the log lists them); `HWDER_EMULATE_AMD=1` makes the
 renderer treat the formats AMD drivers lack (D24S8 depth, 3-component vertex formats) as unsupported, to
