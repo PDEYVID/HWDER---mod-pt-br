@@ -82,7 +82,9 @@ python tools/make_dist.py
 
 If the game ever jumps to an address the recompiler did not know was code, the runtime logs it,
 appends it to `extra_entries.txt` and exits; `tools/iterate.sh` automates the
-regenerate-rebuild-rerun loop. The current entry list already covers normal play.
+regenerate-rebuild-rerun loop. Addresses found that way are collected in
+`tools/recomp/known_entries.txt` (guest addresses only, no code), which `gen_main` always reads, so a
+fresh checkout boots without that loop; please send new ones found in play.
 
 ---
 

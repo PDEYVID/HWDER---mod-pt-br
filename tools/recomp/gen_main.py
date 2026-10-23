@@ -39,9 +39,12 @@ def main():
 
     proc = Process(a.exefs)
     extra = set()
-    if os.path.exists(a.extra):
-        extra = {int(x, 16) for x in open(a.extra).read().split() if x.strip()}
-        log(f"{len(extra)} extra entry points from {a.extra}")
+    # known_entries.txt (committed: guest addresses only, base game v0) + the local list iterate.sh grows.
+    for path in (os.path.join(HERE, "known_entries.txt"), a.extra):
+        if os.path.exists(path):
+            got = {int(x, 16) for x in open(path).read().split() if x.strip()}
+            extra |= got
+            log(f"{len(got)} extra entry points from {path}")
     os.makedirs(a.out, exist_ok=True)
 
     all_starts, files, mod_infos, resumable = [], [], [], []
