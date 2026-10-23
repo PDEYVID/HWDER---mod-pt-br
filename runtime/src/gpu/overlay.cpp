@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <filesystem>
 #include <mutex>
 #include <unordered_map>
@@ -44,6 +45,112 @@ static double g_frame_ms[120];
 static int g_frame_i = 0;
 static LARGE_INTEGER g_last_t;
 
+// F1 menu text: English in the code, Portuguese (Brazil) from this table (settings::ui_language()).
+static const char* tr(const char* en) {
+    if (settings::ui_language() != 1) return en;
+    static const std::unordered_map<std::string_view, const char*> pt = {
+        {"press a key...", "aperte uma tecla..."},
+        {"press a button...", "aperte um botão..."},
+        {"Click to rebind, right-click to clear", "Clique para trocar, botão direito para limpar"},
+        {"Controller", "Controle"},
+        {"Automatic (first connected)", "Automático (primeiro conectado)"},
+        {"Controller %d%s", "Controle %d%s"},
+        {" (not connected)", " (desconectado)"},
+        {"Use", "Usar"},
+        {"  (connected)", "  (conectado)"},
+        {"Controller %d in use", "Controle %d em uso"},
+        {"No XInput controller detected - keyboard only", "Nenhum controle XInput detectado - só teclado"},
+        {"Face button layout:", "Layout dos botões:"},
+        {"Switch positions", "Posições do Switch"},
+        {"Bottom button = Switch B, right = A (same place as on a Switch pad). Default.", "Botão de baixo = B do Switch, da direita = A (mesma posição do controle do Switch). Padrão."},
+        {"Xbox labels", "Letras do Xbox"},
+        {"Xbox A = Switch A, B = B, X = X, Y = Y (follows the printed letters).", "A do Xbox = A do Switch, B = B, X = X, Y = Y (segue as letras impressas)."},
+        {"Left stick deadzone", "Zona morta do analógico esquerdo"},
+        {"Right stick deadzone", "Zona morta do analógico direito"},
+        {"ZL/ZR trigger threshold", "Sensibilidade do ZL/ZR"},
+        {"Vibration", "Vibração"},
+        {"off", "desligada"},
+        {"Invert camera X", "Inverter câmera X"},
+        {"Invert camera Y", "Inverter câmera Y"},
+        {"Bindings", "Comandos"},
+        {"Esc cancels a capture. F1 and F11 are reserved.", "Esc cancela a captura. F1 e F11 são reservadas."},
+        {"Keyboard", "Teclado"},
+        {"Keyboard (alt)", "Teclado (alt.)"},
+        {"left stick", "analógico esquerdo"},
+        {"right stick", "analógico direito"},
+        {"Reset keyboard", "Restaurar teclado"},
+        {"Reset controller", "Restaurar controle"},
+        {"Input test", "Teste de comandos"},
+        {"Left stick %+6.2f %+6.2f   Right stick %+6.2f %+6.2f", "Analógico esq. %+6.2f %+6.2f   Analógico dir. %+6.2f %+6.2f"},
+        {"The game does not receive keyboard input while this menu is open.", "O jogo não recebe o teclado enquanto este menu está aberto."},
+        {"Preparing shaders... %d left", "Preparando shaders... faltam %d"},
+        {"HWDER - Options   (F1 closes)", "HWDER - Opções   (F1 fecha)"},
+        {"Controls", "Controles"},
+        {"Video", "Vídeo"},
+        {"Display", "Tela"},
+        {"Off (60 fps)", "Desligada (60 fps)"},
+        {"Match display refresh", "Igual à taxa do monitor"},
+        {"Frame interpolation", "Interpolação de quadros"},
+        {"The game runs at 60 fps. With interpolation each frame is re-rendered in between with blended\n3D positions (camera, characters), so motion is smooth on 120/144 Hz panels. The HUD and 2D\nelements show the newest frame. Costs extra GPU/CPU work per output frame, and adds one\nframe of latency. Turn it off if your PC can't hold the rate.", "O jogo roda a 60 fps. Com a interpolação, quadros intermediários são desenhados com as posições\n3D misturadas (câmera, personagens), deixando o movimento suave em telas de 120/144 Hz. O HUD e\nos elementos 2D mostram o quadro mais novo. Custa trabalho extra de GPU/CPU por quadro e\nadiciona um quadro de atraso. Desligue se o seu PC não aguentar a taxa."},
+        {"Switch monitor to 60 Hz while playing", "Mudar o monitor para 60 Hz durante o jogo"},
+        {"The game renders at 60 fps and its movies at 30 fps. On a 144 Hz panel each frame is shown for\n2 or 3 (movies: 4 or 5) refreshes in turn, which looks like stutter. At 60 Hz every frame is\nshown exactly once (movies: twice). Reverts when the game exits. Not with frame interpolation.", "O jogo desenha a 60 fps e os vídeos a 30 fps. Numa tela de 144 Hz cada quadro fica 2 ou 3\natualizações na tela (vídeos: 4 ou 5), alternando, o que parece engasgo. A 60 Hz cada quadro\naparece exatamente uma vez (vídeos: duas). Volta ao normal quando o jogo fecha. Não funciona com interpolação."},
+        {"Game logic runs at a fixed 60 fps (the game advances one step per frame). Higher refresh rates come from frame interpolation above.", "A lógica do jogo roda fixa a 60 fps (o jogo avança um passo por quadro). Taxas maiores vêm da interpolação de quadros acima."},
+        {"VSync (FIFO)", "VSync (FIFO)"},
+        {"Off = mailbox presentation (lowest latency).\nOn = classic vsync; use it if you see tearing.", "Desligado = apresentação mailbox (menor atraso).\nLigado = vsync clássico; use se a imagem rasgar."},
+        {"Window", "Janela"},
+        {"Borderless fullscreen (F11)", "Tela cheia sem bordas (F11)"},
+        {"Window size", "Tamanho da janela"},
+        {"Rendering", "Renderização"},
+        {"Game default", "Padrão do jogo"},
+        {"2x anisotropic", "Anisotrópico 2x"},
+        {"4x anisotropic", "Anisotrópico 4x"},
+        {"8x anisotropic", "Anisotrópico 8x"},
+        {"16x anisotropic", "Anisotrópico 16x"},
+        {"Texture filtering", "Filtro de texturas"},
+        {"Internal resolution", "Resolução interna"},
+        {"Unlocked resolution (render at the window's size)", "Resolução livre (desenha no tamanho da janela)"},
+        {"Scene render targets are allocated at this scale (UI and small post-process targets stay native).\nUnlocked = the window's own size and aspect (ultrawide fills the screen); it overrides the scale above.\nOn a 1920x1080 window that equals 1.00x, i.e. the game's native resolution. Applies immediately.", "As imagens da cena são criadas nesta escala (a interface e pequenos efeitos ficam na resolução nativa).\nLivre = o tamanho e o formato da própria janela (ultrawide ocupa a tela toda); substitui a escala acima.\nNuma janela 1920x1080 isso equivale a 1,00x, a resolução nativa do jogo. Aplica na hora."},
+        {"Rendering 3D at %dx%d (%.2fx x %.2fx)%s", "3D sendo desenhado em %dx%d (%.2fx x %.2fx)%s"},
+        {"  [unlocked: follows the window]", "  [livre: segue a janela]"},
+        {"Show frame time", "Mostrar tempo de quadro"},
+        {"Cheats (save file)", "Cheats (arquivo de save)"},
+        {"no save found under ./save", "nenhum save encontrado em ./save"},
+        {"Snapshot save", "Guardar cópia do save"},
+        {"snapshot taken (", "cópia guardada ("},
+        {" bytes)", " bytes)"},
+        {"Diff vs snapshot", "Comparar com a cópia"},
+        {" bytes changed in ", " bytes mudaram em "},
+        {" regions", " regiões"},
+        {"Import unlocks from reference", "Importar desbloqueios da referência"},
+        {" flags set - restart the game (backup: zmha.bin.bak)", " flags ativadas - reinicie o jogo (backup: zmha.bin.bak)"},
+        {"no reference save at save_reference/zmha.bin", "nenhum save de referência em save_reference/zmha.bin"},
+        {"could not read the save", "não foi possível ler o save"},
+        {"Settings are saved to hwder_settings.ini when changed.", "As configurações são salvas no hwder_settings.ini ao mudar."},
+        {"Language", "Idioma"},
+        {"Automatic", "Automático"},
+        {"Left stick up", "Analógico esquerdo cima"},
+        {"Left stick down", "Analógico esquerdo baixo"},
+        {"Left stick left", "Analógico esquerdo esquerda"},
+        {"Left stick right", "Analógico esquerdo direita"},
+        {"Right stick up", "Analógico direito cima"},
+        {"Right stick down", "Analógico direito baixo"},
+        {"Right stick left", "Analógico direito esquerda"},
+        {"Right stick right", "Analógico direito direita"},
+        {"+ (Plus)", "+ (Mais)"},
+        {"- (Minus)", "- (Menos)"},
+        {"Left stick click", "Clique do analógico esquerdo"},
+        {"Right stick click", "Clique do analógico direito"},
+        {"D-pad up", "Direcional cima"},
+        {"D-pad down", "Direcional baixo"},
+        {"D-pad left", "Direcional esquerda"},
+        {"D-pad right", "Direcional direita"},
+        {"LS click", "Clique LS"},
+        {"RS click", "Clique RS"},
+    };
+    auto it = pt.find(en);
+    return it != pt.end() ? it->second : en;
+}
+
 static void check_vk(VkResult r) {
     if (r != VK_SUCCESS) hw_log("overlay: vulkan error %d", (int)r);
 }
@@ -60,6 +167,9 @@ void init(HWND hwnd, VkInstance instance, VkPhysicalDevice phys, VkDevice dev, u
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // window positions are not worth a file
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // ImGui's built-in font is ASCII only: Portuguese text and localized key names need Latin-1.
+    if (GetFileAttributesW(L"C:\\Windows\\Fonts\\segoeui.ttf") != INVALID_FILE_ATTRIBUTES)
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, nullptr, io.Fonts->GetGlyphRangesDefault());
     ImGui::StyleColorsDark();
     ImGui::GetStyle().WindowRounding = 6.0f;
     ImGui_ImplWin32_Init(hwnd);
@@ -190,7 +300,7 @@ static bool binding_button(int action, int slot, const std::string& label) {
     bool changed = false;
     bool capturing = g_capture_action == action && g_capture_slot == slot;
     char id[96];
-    snprintf(id, sizeof(id), "%s##b%d_%d", capturing ? (slot < 2 ? "press a key..." : "press a button...") : label.c_str(),
+    snprintf(id, sizeof(id), "%s##b%d_%d", capturing ? (slot < 2 ? tr("press a key...") : tr("press a button...")) : label.c_str(),
              action, slot);
     if (capturing) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
     if (ImGui::Button(id, ImVec2(-FLT_MIN, 0))) {
@@ -206,7 +316,7 @@ static bool binding_button(int action, int slot, const std::string& label) {
         else in.pad[action] = settings::kPadNone;
         changed = true;
     }
-    if (ImGui::IsItemHovered() && !capturing) ImGui::SetTooltip("Click to rebind, right-click to clear");
+    if (ImGui::IsItemHovered() && !capturing) ImGui::SetTooltip(tr("Click to rebind, right-click to clear"));
     return changed;
 }
 
@@ -232,74 +342,74 @@ static bool controls_tab() {
         }
     }
 
-    ImGui::SeparatorText("Controller");
+    ImGui::SeparatorText(tr("Controller"));
     {
         int active = hid::active_pad();
         char cur[48];
-        if (in.pad_index < 0) snprintf(cur, sizeof(cur), "Automatic (first connected)");
-        else snprintf(cur, sizeof(cur), "Controller %d%s", in.pad_index + 1, hid::pad_connected(in.pad_index) ? "" : " (not connected)");
-        if (ImGui::BeginCombo("Use", cur)) {
-            if (ImGui::Selectable("Automatic (first connected)", in.pad_index < 0)) in.pad_index = -1, changed = true;
+        if (in.pad_index < 0) snprintf(cur, sizeof(cur), tr("Automatic (first connected)"));
+        else snprintf(cur, sizeof(cur), tr("Controller %d%s"), in.pad_index + 1, hid::pad_connected(in.pad_index) ? "" : tr(" (not connected)"));
+        if (ImGui::BeginCombo(tr("Use"), cur)) {
+            if (ImGui::Selectable(tr("Automatic (first connected)"), in.pad_index < 0)) in.pad_index = -1, changed = true;
             for (int i = 0; i < 4; i++) {
                 char item[48];
-                snprintf(item, sizeof(item), "Controller %d%s", i + 1, hid::pad_connected(i) ? "  (connected)" : "");
+                snprintf(item, sizeof(item), tr("Controller %d%s"), i + 1, hid::pad_connected(i) ? tr("  (connected)") : "");
                 if (ImGui::Selectable(item, in.pad_index == i)) in.pad_index = i, changed = true;
             }
             ImGui::EndCombo();
         }
-        if (active >= 0) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), "Controller %d in use", active + 1);
-        else ImGui::TextDisabled("No XInput controller detected - keyboard only");
+        if (active >= 0) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1), tr("Controller %d in use"), active + 1);
+        else ImGui::TextDisabled(tr("No XInput controller detected - keyboard only"));
     }
-    ImGui::TextUnformatted("Face button layout:");
+    ImGui::TextUnformatted(tr("Face button layout:"));
     ImGui::SameLine();
-    if (ImGui::SmallButton("Switch positions")) settings::default_pad(in, false), changed = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bottom button = Switch B, right = A (same place as on a Switch pad). Default.");
+    if (ImGui::SmallButton(tr("Switch positions"))) settings::default_pad(in, false), changed = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Bottom button = Switch B, right = A (same place as on a Switch pad). Default."));
     ImGui::SameLine();
-    if (ImGui::SmallButton("Xbox labels")) settings::default_pad(in, true), changed = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Xbox A = Switch A, B = B, X = X, Y = Y (follows the printed letters).");
-    changed |= ImGui::SliderInt("Left stick deadzone", &in.deadzone_l, 0, 60, "%d%%");
-    changed |= ImGui::SliderInt("Right stick deadzone", &in.deadzone_r, 0, 60, "%d%%");
-    changed |= ImGui::SliderInt("ZL/ZR trigger threshold", &in.trigger, 5, 95, "%d%%");
-    changed |= ImGui::SliderInt("Vibration", &in.rumble, 0, 100, in.rumble ? "%d%%" : "off");
-    changed |= ImGui::Checkbox("Invert camera X", &in.invert_rx);
+    if (ImGui::SmallButton(tr("Xbox labels"))) settings::default_pad(in, true), changed = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Xbox A = Switch A, B = B, X = X, Y = Y (follows the printed letters)."));
+    changed |= ImGui::SliderInt(tr("Left stick deadzone"), &in.deadzone_l, 0, 60, "%d%%");
+    changed |= ImGui::SliderInt(tr("Right stick deadzone"), &in.deadzone_r, 0, 60, "%d%%");
+    changed |= ImGui::SliderInt(tr("ZL/ZR trigger threshold"), &in.trigger, 5, 95, "%d%%");
+    changed |= ImGui::SliderInt(tr("Vibration"), &in.rumble, 0, 100, in.rumble ? "%d%%" : tr("off"));
+    changed |= ImGui::Checkbox(tr("Invert camera X"), &in.invert_rx);
     ImGui::SameLine();
-    changed |= ImGui::Checkbox("Invert camera Y", &in.invert_ry);
+    changed |= ImGui::Checkbox(tr("Invert camera Y"), &in.invert_ry);
 
-    ImGui::SeparatorText("Bindings");
-    ImGui::TextDisabled("Esc cancels a capture. F1 and F11 are reserved.");
+    ImGui::SeparatorText(tr("Bindings"));
+    ImGui::TextDisabled(tr("Esc cancels a capture. F1 and F11 are reserved."));
     if (ImGui::BeginTable("##binds", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY,
-                          ImVec2(0, 300))) {
+                          ImVec2(0, 230))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Switch", ImGuiTableColumnFlags_WidthStretch, 1.3f);
-        ImGui::TableSetupColumn("Keyboard", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Keyboard (alt)", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn(tr("Keyboard"), ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn(tr("Keyboard (alt)"), ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn(tr("Controller"), ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableHeadersRow();
         for (int a = 0; a < settings::kActCount; a++) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(settings::action_name(a));
+            ImGui::TextUnformatted(tr(settings::action_name(a)));
             for (int slot = 0; slot < 2; slot++) {
                 ImGui::TableNextColumn();
                 changed |= binding_button(a, slot, key_name(in.keys[a][slot]));
             }
             ImGui::TableNextColumn();
-            if (settings::is_stick_action(a)) ImGui::TextDisabled(a < settings::kActRUp ? "left stick" : "right stick");
-            else changed |= binding_button(a, 2, settings::pad_source_name(in.pad[a]));
+            if (settings::is_stick_action(a)) ImGui::TextDisabled(a < settings::kActRUp ? tr("left stick") : tr("right stick"));
+            else changed |= binding_button(a, 2, tr(settings::pad_source_name(in.pad[a])));
         }
         ImGui::EndTable();
     }
-    if (ImGui::Button("Reset keyboard")) settings::default_keys(in), changed = true;
+    if (ImGui::Button(tr("Reset keyboard"))) settings::default_keys(in), changed = true;
     ImGui::SameLine();
-    if (ImGui::Button("Reset controller")) {
+    if (ImGui::Button(tr("Reset controller"))) {
         settings::default_pad(in, false);
         in.deadzone_l = 24, in.deadzone_r = 26, in.trigger = 25, in.rumble = 100;
         in.invert_rx = in.invert_ry = false;
         changed = true;
     }
 
-    ImGui::SeparatorText("Input test");
+    ImGui::SeparatorText(tr("Input test"));
     {
         hid::PadInput p = hid::last_input();
         static const struct {
@@ -317,9 +427,9 @@ static bool controls_tab() {
             ImGui::SameLine();
         }
         ImGui::NewLine();
-        ImGui::Text("Left stick %+6.2f %+6.2f   Right stick %+6.2f %+6.2f", p.lx / (float)hid::kStickMax,
+        ImGui::Text(tr("Left stick %+6.2f %+6.2f   Right stick %+6.2f %+6.2f"), p.lx / (float)hid::kStickMax,
                     p.ly / (float)hid::kStickMax, p.rx / (float)hid::kStickMax, p.ry / (float)hid::kStickMax);
-        ImGui::TextDisabled("The game does not receive keyboard input while this menu is open.");
+        ImGui::TextDisabled(tr("The game does not receive keyboard input while this menu is open."));
     }
     return changed;
 }
@@ -347,32 +457,41 @@ static void build_ui(VkExtent2D extent) {
         ImGui::Begin("##shaders", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-        ImGui::Text("Preparing shaders... %d left", left);
+        ImGui::Text(tr("Preparing shaders... %d left"), left);
         ImGui::End();
     }
     if (!g_visible) return;
 
     ImGui::SetNextWindowPos(ImVec2(extent.width * 0.5f, extent.height * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(640, 0), ImGuiCond_Appearing);
-    ImGui::Begin("HWDER - Options   (F1 closes)", &g_visible, ImGuiWindowFlags_NoCollapse);
+    ImGui::SetNextWindowSize(ImVec2(720, 0), ImGuiCond_Appearing);
+    ImGui::Begin(tr("HWDER - Options   (F1 closes)"), &g_visible, ImGuiWindowFlags_NoCollapse);
+    {
+        const char* langs[] = {tr("Automatic"), "English", "Português (Brasil)"};
+        int cur = v.language + 1;
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::Combo(tr("Language"), &cur, langs, 3)) {
+            v.language = cur - 1;
+            changed = true;
+        }
+    }
     if (!ImGui::BeginTabBar("##tabs")) {
         ImGui::End();
         return;
     }
-    if (ImGui::BeginTabItem("Controls")) {
+    if (ImGui::BeginTabItem(tr("Controls"))) {
         changed |= controls_tab();
         ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem("Video")) {
-        ImGui::SeparatorText("Display");
+    if (ImGui::BeginTabItem(tr("Video"))) {
+        ImGui::SeparatorText(tr("Display"));
         {
             // interp_hz: 0 off, -1 match the display, else a fixed output rate.
             const int values[] = {0, -1, 120, 144};
-            const char* items[] = {"Off (60 fps)", "Match display refresh", "120 Hz", "144 Hz"};
+            const char* items[] = {tr("Off (60 fps)"), tr("Match display refresh"), "120 Hz", "144 Hz"};
             int cur = 0;
             for (int i = 0; i < 4; i++)
                 if (values[i] == v.interp_hz) cur = i;
-            if (ImGui::Combo("Frame interpolation", &cur, items, 4)) {
+            if (ImGui::Combo(tr("Frame interpolation"), &cur, items, 4)) {
                 v.interp_hz = values[cur];
                 changed = true;
                 // Interpolation needs the panel's full refresh rate: drop the 60 Hz monitor switch.
@@ -384,35 +503,35 @@ static void build_ui(VkExtent2D extent) {
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("The game runs at 60 fps. With interpolation each frame is re-rendered in between with blended\n"
+                ImGui::SetTooltip(tr("The game runs at 60 fps. With interpolation each frame is re-rendered in between with blended\n"
                                   "3D positions (camera, characters), so motion is smooth on 120/144 Hz panels. The HUD and 2D\n"
                                   "elements show the newest frame. Costs extra GPU/CPU work per output frame, and adds one\n"
-                                  "frame of latency. Turn it off if your PC can't hold the rate.");
+                                  "frame of latency. Turn it off if your PC can't hold the rate."));
         }
         ImGui::BeginDisabled(v.interp_hz != 0);
-        if (ImGui::Checkbox("Switch monitor to 60 Hz while playing", &v.display_60hz)) {
+        if (ImGui::Checkbox(tr("Switch monitor to 60 Hz while playing"), &v.display_60hz)) {
             changed = true;
             PostMessageW(g_hwnd, kMsgDisplay60, 0, v.display_60hz ? 1 : 0);
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The game renders at 60 fps and its movies at 30 fps. On a 144 Hz panel each frame is shown for\n"
+            ImGui::SetTooltip(tr("The game renders at 60 fps and its movies at 30 fps. On a 144 Hz panel each frame is shown for\n"
                               "2 or 3 (movies: 4 or 5) refreshes in turn, which looks like stutter. At 60 Hz every frame is\n"
-                              "shown exactly once (movies: twice). Reverts when the game exits. Not with frame interpolation.");
+                              "shown exactly once (movies: twice). Reverts when the game exits. Not with frame interpolation."));
         ImGui::EndDisabled();
-        ImGui::TextWrapped("Game logic runs at a fixed 60 fps (the game advances one step per frame). Higher refresh rates "
-                           "come from frame interpolation above.");
-        if (ImGui::Checkbox("VSync (FIFO)", &v.vsync)) {
+        ImGui::TextWrapped(tr("Game logic runs at a fixed 60 fps (the game advances one step per frame). Higher refresh rates "
+                           "come from frame interpolation above."));
+        if (ImGui::Checkbox(tr("VSync (FIFO)"), &v.vsync)) {
             changed = true;
             g_swapchain_dirty = true;
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off = mailbox presentation (lowest latency).\nOn = classic vsync; use it if you see tearing.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Off = mailbox presentation (lowest latency).\nOn = classic vsync; use it if you see tearing."));
 
-        ImGui::SeparatorText("Window");
-        if (ImGui::Checkbox("Borderless fullscreen (F11)", &v.borderless)) {
+        ImGui::SeparatorText(tr("Window"));
+        if (ImGui::Checkbox(tr("Borderless fullscreen (F11)"), &v.borderless)) {
             changed = true;
             post_window_change();
         }
@@ -421,7 +540,7 @@ static void build_ui(VkExtent2D extent) {
             char cur[32];
             snprintf(cur, sizeof(cur), "%ux%u", extent.width, extent.height);
             ImGui::BeginDisabled(v.borderless);
-            if (ImGui::BeginCombo("Window size", cur)) {
+            if (ImGui::BeginCombo(tr("Window size"), cur)) {
                 for (auto& s : sizes) {
                     char item[32];
                     snprintf(item, sizeof(item), "%dx%d", s[0], s[1]);
@@ -437,14 +556,14 @@ static void build_ui(VkExtent2D extent) {
             ImGui::EndDisabled();
         }
 
-        ImGui::SeparatorText("Rendering");
+        ImGui::SeparatorText(tr("Rendering"));
         {
             static const int levels[] = {0, 2, 4, 8, 16};
-            static const char* names[] = {"Game default", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic"};
+            const char* names[] = {tr("Game default"), tr("2x anisotropic"), tr("4x anisotropic"), tr("8x anisotropic"), tr("16x anisotropic")};
             int cur = 0;
             for (int i = 0; i < 5; i++)
                 if (levels[i] == v.aniso) cur = i;
-            if (ImGui::BeginCombo("Texture filtering", names[cur])) {
+            if (ImGui::BeginCombo(tr("Texture filtering"), names[cur])) {
                 for (int i = 0; i < 5; i++)
                     if (ImGui::Selectable(names[i], cur == i)) {
                         v.aniso = levels[i];
@@ -460,7 +579,7 @@ static void build_ui(VkExtent2D extent) {
                 if (fabsf(steps[i] - v.res_scale) < 0.01f) cur = i;
             char label[64];
             snprintf(label, sizeof(label), "%.2fx  (%dx%d)", steps[cur], (int)(1920 * steps[cur]), (int)(1080 * steps[cur]));
-            if (ImGui::BeginCombo("Internal resolution", label)) {
+            if (ImGui::BeginCombo(tr("Internal resolution"), label)) {
                 for (int i = 0; i < 7; i++) {
                     char item[64];
                     snprintf(item, sizeof(item), "%.2fx  (%dx%d)", steps[i], (int)(1920 * steps[i]), (int)(1080 * steps[i]));
@@ -471,26 +590,26 @@ static void build_ui(VkExtent2D extent) {
                 }
                 ImGui::EndCombo();
             }
-            if (ImGui::Checkbox("Unlocked resolution (render at the window's size)", &v.unlocked_res)) changed = true;
+            if (ImGui::Checkbox(tr("Unlocked resolution (render at the window's size)"), &v.unlocked_res)) changed = true;
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Scene render targets are allocated at this scale (UI and small post-process targets stay native).\n"
+                ImGui::SetTooltip(tr("Scene render targets are allocated at this scale (UI and small post-process targets stay native).\n"
                                   "Unlocked = the window's own size and aspect (ultrawide fills the screen); it overrides the scale above.\n"
-                                  "On a 1920x1080 window that equals 1.00x, i.e. the game's native resolution. Applies immediately.");
+                                  "On a 1920x1080 window that equals 1.00x, i.e. the game's native resolution. Applies immediately."));
             {
                 float sx = ::hwder_render_scale_x(), sy = ::hwder_render_scale_y();
-                ImGui::TextDisabled("Rendering 3D at %dx%d (%.2fx x %.2fx)%s", (int)(1920 * sx + 0.5f), (int)(1080 * sy + 0.5f), sx, sy,
-                                    v.unlocked_res ? "  [unlocked: follows the window]" : "");
+                ImGui::TextDisabled(tr("Rendering 3D at %dx%d (%.2fx x %.2fx)%s"), (int)(1920 * sx + 0.5f), (int)(1080 * sy + 0.5f), sx, sy,
+                                    v.unlocked_res ? tr("  [unlocked: follows the window]") : "");
             }
         }
 
         ImGui::SeparatorText("Overlay");
-        if (ImGui::Checkbox("Show frame time", &v.show_fps)) changed = true;
+        if (ImGui::Checkbox(tr("Show frame time"), &v.show_fps)) changed = true;
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Cheats")) {
-        ImGui::SeparatorText("Cheats (save file)");
+        ImGui::SeparatorText(tr("Cheats (save file)"));
         {
             static std::string status;
             static std::vector<std::pair<size_t, size_t>> clusters;
@@ -517,14 +636,14 @@ static void build_ui(VkExtent2D extent) {
                 return d;
             };
             std::string sp = save_path();
-            ImGui::TextDisabled("%s", sp.empty() ? "no save found under ./save" : sp.c_str());
-            if (ImGui::Button("Snapshot save")) {
+            ImGui::TextDisabled("%s", sp.empty() ? tr("no save found under ./save") : sp.c_str());
+            if (ImGui::Button(tr("Snapshot save"))) {
                 auto d = read_all(sp);
                 if (FILE* f = fopen("save_snapshot.bin", "wb")) { fwrite(d.data(), 1, d.size(), f); fclose(f); }
-                status = "snapshot taken (" + std::to_string(d.size()) + " bytes)";
+                status = tr("snapshot taken (") + std::to_string(d.size()) + tr(" bytes)");
             }
             ImGui::SameLine();
-            if (ImGui::Button("Diff vs snapshot")) {
+            if (ImGui::Button(tr("Diff vs snapshot"))) {
                 auto a = read_all("save_snapshot.bin"), b = read_all(sp);
                 clusters.clear();
                 size_t n = std::min(a.size(), b.size()), start = SIZE_MAX, prev = 0, total = 0;
@@ -536,11 +655,11 @@ static void build_ui(VkExtent2D extent) {
                     prev = i;
                 }
                 if (start != SIZE_MAX) clusters.push_back({start, prev});
-                status = std::to_string(total) + " bytes changed in " + std::to_string(clusters.size()) + " regions";
+                status = std::to_string(total) + tr(" bytes changed in ") + std::to_string(clusters.size()) + tr(" regions");
                 for (auto& c : clusters) hw_log("cheats: save changed 0x%zx-0x%zx (%zu bytes)", c.first, c.second, c.second - c.first + 1);
             }
             ImGui::SameLine();
-            if (ImGui::Button("Import unlocks from reference")) {
+            if (ImGui::Button(tr("Import unlocks from reference"))) {
                 // Reference = a 100% save at save_reference/zmha.bin. Every byte that is 0 here and 1 there
                 // is set (unlock/clear flags); counters and other values are left alone. The game reads its
                 // save at boot, so this takes effect on the next launch.
@@ -551,9 +670,9 @@ static void build_ui(VkExtent2D extent) {
                 if (!ref.empty() && !cur.empty()) {
                     if (FILE* f = fopen((sp + ".bak").c_str(), "wb")) { auto o = read_all(sp); fwrite(o.data(), 1, o.size(), f); fclose(f); }
                     if (FILE* f = fopen(sp.c_str(), "wb")) { fwrite(cur.data(), 1, cur.size(), f); fclose(f); }
-                    status = std::to_string(changed) + " flags set - restart the game (backup: zmha.bin.bak)";
+                    status = std::to_string(changed) + tr(" flags set - restart the game (backup: zmha.bin.bak)");
                 } else {
-                    status = ref.empty() ? "no reference save at save_reference/zmha.bin" : "could not read the save";
+                    status = ref.empty() ? tr("no reference save at save_reference/zmha.bin") : tr("could not read the save");
                 }
             }
             if (!status.empty()) ImGui::TextWrapped("%s", status.c_str());
@@ -565,7 +684,7 @@ static void build_ui(VkExtent2D extent) {
     }
     ImGui::EndTabBar();
     ImGui::Separator();
-    ImGui::TextDisabled("Settings are saved to hwder_settings.ini when changed.");
+    ImGui::TextDisabled(tr("Settings are saved to hwder_settings.ini when changed."));
     ImGui::End();
     if (changed) settings::save();
     (void)io;

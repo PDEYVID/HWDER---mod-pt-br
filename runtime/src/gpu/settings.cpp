@@ -82,6 +82,12 @@ void default_pad(Input& in, bool xbox_labels) {
 Video& video() { return g_video; }
 Input& input() { return g_input; }
 
+int ui_language() {
+    if (g_video.language >= 0) return g_video.language;
+    static const int sys = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_PORTUGUESE ? 1 : 0;
+    return sys;
+}
+
 void load() {
     // Default for the 60 Hz monitor switch: on when the desktop refresh is not a multiple of 60. The game
     // runs at 60 fps and its movies at 30; on a 144 Hz panel FIFO presentation shows frames for 2/3 or
@@ -112,6 +118,7 @@ void load() {
         else if (k == "show_fps") g_video.show_fps = atoi(v) != 0;
         else if (k == "display_60hz") g_video.display_60hz = atoi(v) != 0;
         else if (k == "interp_hz") g_video.interp_hz = atoi(v);
+        else if (k == "language") g_video.language = atoi(v);
         else if (k == "pad_index") g_input.pad_index = atoi(v);
         else if (k == "deadzone_l") g_input.deadzone_l = atoi(v);
         else if (k == "deadzone_r") g_input.deadzone_r = atoi(v);
@@ -140,6 +147,7 @@ void save() {
             g_video.refresh, (int)g_video.vsync, g_video.aniso, g_video.window_w, g_video.window_h, (int)g_video.borderless,
             g_video.res_scale, (int)g_video.unlocked_res, (int)g_video.show_fps, (int)g_video.display_60hz, g_video.interp_hz);
     const Input& in = g_input;
+    fprintf(f, "language=%d\n", g_video.language);
     fprintf(f, "pad_index=%d\ndeadzone_l=%d\ndeadzone_r=%d\ntrigger=%d\ninvert_rx=%d\ninvert_ry=%d\nrumble=%d\n", in.pad_index,
             in.deadzone_l, in.deadzone_r, in.trigger, (int)in.invert_rx, (int)in.invert_ry, in.rumble);
     for (int a = 0; a < kActCount; a++) {

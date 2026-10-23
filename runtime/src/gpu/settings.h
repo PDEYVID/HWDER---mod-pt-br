@@ -15,7 +15,9 @@ struct Video {
     bool show_fps = false;      // small frame-time readout in the corner
     int interp_hz = 0;          // frame interpolation output rate: 0 off, -1 match display, else Hz
     bool display_60hz = false;  // switch the monitor to 60 Hz while the game runs (even cadence for 60/30 fps content)
+    int language = -1;          // F1 menu: -1 = follow Windows, 0 = English, 1 = Portuguese (Brazil)
 };
+int ui_language();  // `language` resolved: 0 English, 1 Portuguese
 
 // Switch-side inputs that can be bound, in the order the Controls tab lists them.
 enum Action : int {
